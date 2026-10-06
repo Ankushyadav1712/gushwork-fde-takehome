@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512"><rect width="512" height="512" rx="112" fill="#1D6FB8"/><g transform="translate(256 256) scale(1) translate(-256 -256)">
+    <g transform="translate(84 112) scale(13.4)">
+      <path d="M5 4h4l2 5-2.5 1.5a11 11 0 0 0 5 5L15 13l5 2v4a2 2 0 0 1-2 2A16 16 0 0 1 3 6a2 2 0 0 1 2-2z" fill="#FFFFFF" stroke="#FFFFFF" stroke-width="1.6" stroke-linejoin="round"/>
+    </g>
+    <g stroke="#CFE8FF" stroke-width="17" stroke-linecap="round" stroke-linejoin="round" fill="none"><g transform="rotate(0 368 150)">
+      <line x1="368" y1="88" x2="368" y2="212"/>
+      <polyline points="348.16,96.68 368,115.28 387.84,96.68"/>
+      <polyline points="348.16,203.32 368,184.72 387.84,203.32"/>
+    </g><g transform="rotate(60 368 150)">
+      <line x1="368" y1="88" x2="368" y2="212"/>
+      <polyline points="348.16,96.68 368,115.28 387.84,96.68"/>
+      <polyline points="348.16,203.32 368,184.72 387.84,203.32"/>
+    </g><g transform="rotate(120 368 150)">
+      <line x1="368" y1="88" x2="368" y2="212"/>
+      <polyline points="348.16,96.68 368,115.28 387.84,96.68"/>
+      <polyline points="348.16,203.32 368,184.72 387.84,203.32"/>
+    </g></g>
+  </g></svg>
