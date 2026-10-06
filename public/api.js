@@ -6,7 +6,7 @@
 
 export const UNAUTHORIZED_EVENT = "callback:unauthorized";
 
-export class ApiRequestError extends Error {
+class ApiRequestError extends Error {
   constructor(status, code, message) {
     super(message || code || `Request failed (${status})`);
     this.name = "ApiRequestError";
@@ -106,5 +106,5 @@ export const exportCsvUrl = () => "/api/export/jobs.csv";
 // Demo controls (DEMO=1 only)
 export const simInbound = (body) => post("/api/sim/inbound", body);
 export const simClock = (body) => post("/api/sim/clock", body);
-export const simTick = () => post("/api/sim/tick");
 export const simReset = () => post("/api/sim/reset");
+export const getSimPresets = () => get("/api/sim/presets");

@@ -1,41 +1,31 @@
 // Pickers used inside sheets (§5.4, §4.10). Each one ends in a single onPick/onSave call,
 // so an outcome stays within 3 taps of opening the sheet.
 import { html, useState, useEffect, useRef } from "/vendor/preact-htm.js";
-import { localDate, addDays, nextBusinessDay, weekdayName, weekdayOf, shortDateLabel } from "/shared/time.js";
+import { localDate, addDays, nextBusinessDay, weekdayName, shortDateLabel } from "/shared/time.js";
 import { money } from "/shared/format.js";
-import { LOST_REASONS } from "./constants.js";
+import { LOST_REASONS } from "/shared/stages.js";
 import { Icon } from "./icons.js";
 
-/** Day chips for "yes" and "scheduled": Today, Tomorrow, the weekday of today + 2 (calendar days). */
-export function dayChoices(nowIso, tz) {
-  const today = localDate(nowIso, tz);
-  const plus2 = addDays(today, 2);
-  return [
-    { label: "Today", value: today },
-    { label: "Tomorrow", value: addDays(today, 1) },
-    { label: weekdayName(plus2, { long: true }), value: plus2 },
-  ];
-}
-
-// Full names, plus abbreviations that are not everyday words ("sat" and "sun" are left out).
-const WEEKDAY_RE = /\b(monday|mon|tuesday|tues|tue|wednesday|wed|thursday|thurs|thur|thu|friday|fri|saturday|sunday)\b/i;
-const WEEKDAY_INDEX = { sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6 };
+const NEXT_WEEKDAYS = 3;
 
 /**
- * The next date (after today) of the first weekday named in a customer's message, e.g.
- * "thursday works for us" -> Thursday. Lets the day picker offer the day they asked for.
+ * Day chips for "yes" and "scheduled": Today, Tomorrow, then the next 3 weekdays (Mon-Fri)
+ * after tomorrow, by name.
  */
-export function mentionedDay(text, nowIso, tz) {
-  const m = WEEKDAY_RE.exec(String(text || ""));
-  if (!m) return null;
-  const want = WEEKDAY_INDEX[m[1].slice(0, 3).toLowerCase()];
-  let d = addDays(localDate(nowIso, tz), 1);
-  while (weekdayOf(d) !== want) d = addDays(d, 1);
-  return d;
+function dayChoices(nowIso, tz) {
+  const today = localDate(nowIso, tz);
+  const tomorrow = addDays(today, 1);
+  const choices = [{ label: "Today", value: today }, { label: "Tomorrow", value: tomorrow }];
+  let day = tomorrow;
+  for (let i = 0; i < NEXT_WEEKDAYS; i += 1) {
+    day = nextBusinessDay(day);
+    choices.push({ label: weekdayName(day, { long: true }), value: day });
+  }
+  return choices;
 }
 
 /** Snooze chips (§4.10): next business day ("Tomorrow" when it is), then the business day after. */
-export function snoozeChoices(nowIso, tz) {
+function snoozeChoices(nowIso, tz) {
   const today = localDate(nowIso, tz);
   const first = nextBusinessDay(today);
   const second = nextBusinessDay(first);
@@ -51,7 +41,7 @@ function ChoiceButton({ label, onClick, accent = false, wide = false, className 
 }
 
 /** "Pick a day": a native date input plus a confirm button. */
-function PickADay({ min, onPick, tz, label = "Pick a day" }) {
+function PickADay({ min, onPick, tz, wide = true, label = "Pick a day" }) {
   const [open, setOpen] = useState(false);
   const [value, setValue] = useState("");
   const input = useRef(null);
@@ -60,7 +50,7 @@ function PickADay({ min, onPick, tz, label = "Pick a day" }) {
     input.current.focus();
     try { input.current.showPicker?.(); } catch { /* not allowed without a gesture in some browsers */ }
   }, [open]);
-  if (!open) return html`<${ChoiceButton} label=${label} wide onClick=${() => setOpen(true)} />`;
+  if (!open) return html`<${ChoiceButton} label=${label} wide=${wide} onClick=${() => setOpen(true)} />`;
   return html`<div class="pick-day wide">
     <label class="field-label" for="pick-day-input">Day</label>
     <input id="pick-day-input" ref=${input} class="input" type="date" min=${min} value=${value}
@@ -71,17 +61,22 @@ function PickADay({ min, onPick, tz, label = "Pick a day" }) {
   </div>`;
 }
 
-/** `askedFor` (a YYYY-MM-DD the customer named) adds that day as a highlighted chip when it isn't already one. */
-export function DayPicker({ now, tz, allowNone = false, askedFor = null, onPick }) {
+/**
+ * `highlight` (a YYYY-MM-DD: the day the customer asked for, or a suggested visit date) gets the
+ * accent colour, and is added as its own chip when it isn't one of the usual days.
+ */
+export function DayPicker({ now, tz, allowNone = false, highlight = null, onPick }) {
   const today = localDate(now, tz);
   const choices = dayChoices(now, tz);
-  if (askedFor && !choices.some((c) => c.value === askedFor)) {
-    choices.push({ label: weekdayName(askedFor, { long: true }), value: askedFor, asked: true });
+  if (highlight && highlight >= today && !choices.some((c) => c.value === highlight)) {
+    choices.push({ label: weekdayName(highlight, { long: true }), value: highlight });
   }
+  const chipCount = choices.length + (allowNone ? 1 : 0);
   return html`<div class="choice-grid">
-    ${choices.map((c) => html`<${ChoiceButton} key=${c.value} label=${c.label} accent=${Boolean(c.asked)} onClick=${() => onPick(c.value)} />`)}
+    ${choices.map((c) => html`<${ChoiceButton} key=${c.value} label=${c.label} accent=${c.value === highlight}
+      onClick=${() => onPick(c.value)} />`)}
     ${allowNone && html`<${ChoiceButton} label="No date yet" onClick=${() => onPick(null)} />`}
-    <${PickADay} min=${today} tz=${tz} onPick=${onPick} />
+    <${PickADay} min=${today} tz=${tz} wide=${chipCount % 2 === 0} onPick=${onPick} />
   </div>`;
 }
 

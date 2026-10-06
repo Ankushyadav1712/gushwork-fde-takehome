@@ -12,6 +12,7 @@ import { bucketFor, replySuggestion, cardFor } from "../shared/today-rules.js";
 import { parseNotebook, replyIntent } from "../shared/parse.js";
 import { titleFor, sourceLabel } from "../shared/format.js";
 import { atLocal, startOfDay } from "../shared/time.js";
+import { eventsOf } from "./fixtures/history.js";
 
 const TZ = "America/Chicago";
 const A = "2026-10-05T12:00:00.000Z"; // Mon Oct 5 2026 07:00 local
@@ -118,7 +119,7 @@ test("created job: fields, created event and parse_json.rules (§7.1 step 7)", (
   assert.equal(jv.customer.contact_name, "Marco");
   assert.equal(jv.customer.business_name, "Bella Cucina");
   assert.equal(jv.customer.phone, "+13125550142");
-  const [created] = repo.listEvents(db, r.job_id);
+  const [created] = eventsOf(db, r.job_id);
   assert.deepEqual([created.kind, created.actor, created.summary, created.message_id, created.at],
     ["created", "customer", "Text came in", r.message_id, A]);
   const msg = repo.getMessage(db, r.message_id);
@@ -140,7 +141,7 @@ test("seed overrides: opts.fields win over the parse", () => {
   assert.equal(jv.problem, "Walk-in freezer at 28 degrees and climbing");
   assert.equal(jv.source_detail, "voicemail");
   assert.equal(jv.urgent_source, "rules");
-  assert.equal(repo.listEvents(db, r.job_id)[0].summary, "Voicemail came in");
+  assert.equal(eventsOf(db, r.job_id)[0].summary, "Voicemail came in");
 });
 
 // ---------------------------------------------------------------------------
@@ -160,8 +161,7 @@ test("T17: a forwarded text attaches by business name and shows under replied", 
   const jv = repo.getJobView(db, jobId);
   assert.equal(jv.unread_inbound_at, A);
   assert.equal(bucketFor(jv, ctxAt(db, A)), "replied");
-  assert.equal(repo.listEvents(db, jobId)[0].summary,
-    "Forwarded text: Midway Meats: hey denise any update on that freezer door quote?");
+  assert.equal(eventsOf(db, jobId)[0].summary, "You forwarded their text");
 });
 
 test("T17: a forwarded text with no phone and no matching business creates 'Forwarded text - who is this?'", () => {
@@ -174,7 +174,7 @@ test("T17: a forwarded text with no phone and no matching business creates 'Forw
   assert.equal(jv.customer.phone, null);
   assert.equal(titleFor(jv), "Forwarded text - who is this?");
   assert.equal(sourceLabel(jv.source, jv.source_detail), "Forwarded text");
-  assert.equal(repo.listEvents(db, r.job_id)[0].summary, "Forwarded text came in");
+  assert.equal(eventsOf(db, r.job_id)[0].summary, "Forwarded text came in");
 });
 
 test("T17: a forwarded text keeps the original sender's phone (F5)", () => {
@@ -207,9 +207,10 @@ test("T18: a reply attaches to the open job, sets unread_inbound_at, and suggest
   const card = cardFor(jv, ctx);
   assert.equal(card.bucket, "replied");
   assert.deepEqual(card.outcomes[0], { id: "yes", label: "Mark as yes?", primary: true, suggested: true, needs: "day_or_none" });
-  const [inbound] = repo.listEvents(db, jobId);
+  const [inbound] = eventsOf(db, jobId);
+  // The summary is the channel only: Job detail shows the text itself in a quote box (UX-10).
   assert.deepEqual([inbound.kind, inbound.actor, inbound.summary, inbound.message_id],
-    ["inbound", "customer", "Texted: yes go ahead, thursday works for us", r.message_id]);
+    ["inbound", "customer", "Texted back", r.message_id]);
 
   // A second message keeps the first unread time (??=).
   ingestAt(db, sms("+13125550118", "also the door sticks"), at("2026-10-05", "08:00"));
@@ -237,7 +238,7 @@ test("attach: an inbound message can raise urgency, never lower it, and goes to 
   const form = ingestAt(db, fromForm({ phone: "(312) 555-0118", message: "Also need the ice machine cleaned", id: "f1" }),
     at("2026-10-02", "09:00"));
   assert.deepEqual([form.status, form.job_id], ["attached", jobId]);
-  assert.equal(repo.listEvents(db, jobId)[0].summary, "Web form: Also need the ice machine cleaned");
+  assert.equal(eventsOf(db, jobId)[0].summary, "Sent the web form again");
   assert.equal(repo.getJobRow(db, jobId).urgent, 0);
   const r = ingestAt(db, sms("+13125550118", "the walk-in is warm now, food at risk"), A);
   const job = repo.getJobRow(db, r.job_id);
@@ -303,7 +304,7 @@ test("repeat matching: a plain email matches the customer by sender address", ()
 test("blocked customer: the message is logged as 'blocked' and no job is created", () => {
   const db = freshDb();
   const customer = repo.createCustomer(db, { phone: "+13125550155" }, A);
-  repo.setBlocked(db, customer.id, true, A);
+  repo.updateCustomer(db, customer.id, { blocked: 1 }, A);
   const r = ingestAt(db, sms("+13125550155", "Lower your merchant fees today!"), A);
   assert.deepEqual([r.status, r.job_id], ["blocked", null]);
   const msg = repo.getMessage(db, r.message_id);
@@ -312,9 +313,13 @@ test("blocked customer: the message is logged as 'blocked' and no job is created
   assert.equal(repo.unlinkedMessageCount(db), 0);
 });
 
+/** The Twilio <Dial> action callback of a call Denise picked up (Phase 2). */
+const answered = (sid, from, seconds) => fromTwilioVoice({ CallSid: sid, From: from, CallStatus: "in-progress",
+  DialCallStatus: "completed", DialCallDuration: String(seconds) });
+
 test("answered calls under 15 seconds and in-progress statuses are ignored; 15 seconds creates a job", () => {
   const db = freshDb();
-  const short = ingestAt(db, fromTwilioVoice({ CallSid: "CA_short", From: "+13125550155", CallStatus: "completed", CallDuration: "14" }), A);
+  const short = ingestAt(db, answered("CA_short", "+13125550155", 14), A);
   assert.deepEqual([short.status, short.job_id], ["ignored", null]);
   assert.equal(repo.getMessage(db, short.message_id).status, "ignored");
   const ringing = ingestAt(db, fromTwilioVoice({ CallSid: "CA_ring", From: "+13125550156", CallStatus: "ringing" }), A);
@@ -323,7 +328,7 @@ test("answered calls under 15 seconds and in-progress statuses are ignored; 15 s
   assert.equal(generic.status, "ignored");
   assert.equal(count(db, "jobs"), 0);
 
-  const long = ingestAt(db, fromTwilioVoice({ CallSid: "CA_long", From: "+13125550168", CallStatus: "completed", CallDuration: "15" }), A);
+  const long = ingestAt(db, answered("CA_long", "+13125550168", 15), A);
   assert.equal(long.status, "created_job");
   const jv = repo.getJobView(db, long.job_id);
   assert.deepEqual([jv.source, jv.source_detail, jv.problem], ["call", "answered", null]);
@@ -372,7 +377,8 @@ test("voice: a voicemail after a missed-call callback turns the job into a voice
   assert.equal(repo.getJobRow(db, missed.job_id).source_detail, "missed");
   ingestAt(db, fromTwilioVoice({ CallSid: "CA_m", From: "+13125550177", TranscriptionText: "Walk-in cooler is down, call me" }), A);
   const job = repo.getJobRow(db, missed.job_id);
-  assert.deepEqual([job.source_detail, job.problem, job.urgent], ["voicemail", "Walk-in cooler is down, call me", 1]);
+  assert.deepEqual([job.source_detail, job.problem, job.urgent], ["voicemail", "Walk-in cooler is down", 1]);
+  assert.equal(eventsOf(db, missed.job_id)[0].summary, "Voicemail came in");
 });
 
 // ---------------------------------------------------------------------------
@@ -435,11 +441,20 @@ test("AI refine runs in the background, applies grounded values, and never overw
   assert.equal(jv.equipment, "walk_in_cooler"); // rules found equipment: AI ignored
   assert.equal(jv.details, "Customer hears a weird noise from the walk-in.");
   assert.deepEqual([jv.urgent, jv.urgent_source, jv.parsed_by], [1, "ai", "ai"]);
-  const [refined] = repo.listEvents(db, r.job_id);
+  const [refined] = eventsOf(db, r.job_id);
   assert.deepEqual([refined.kind, refined.actor, refined.summary], ["ai_refined", "system", "Details read by AI: name, details, urgent"]);
   const msg = repo.getMessage(db, r.message_id);
   assert.equal(msg.parse.ai.summary, "Walk-in making weird noise");
   assert.equal(msg.parse.merged.phone, "+13125550142");
+});
+
+test("AI refine: its history line is stamped when the read finished, not when the message came in (CC-4)", async () => {
+  const db = freshDb();
+  const slowExtract = () => new Promise((resolve) => setTimeout(() => resolve(MARCO_AI), 30));
+  const r = ingest(db, { ...sms("+13125550142", MARCO_TEXT), received_at: A }, { now: A, extract: slowExtract });
+  await r.refine;
+  const refined = eventsOf(db, r.job_id).find((e) => e.kind === "ai_refined");
+  assert.ok(Date.parse(refined.at) - Date.parse(A) >= 25, refined.at);
 });
 
 test("AI refine: without edits it updates the problem; a spam flag only marks ai_not_service", async () => {
@@ -449,7 +464,7 @@ test("AI refine: without edits it updates the problem; a spam flag only marks ai
   assert.deepEqual(await r.refine, { changed: ["contact_name", "business_name", "problem", "details", "ai_not_service"] });
   const jv = repo.getJobView(db, r.job_id);
   assert.deepEqual([jv.problem, jv.stage, jv.ai_not_service, jv.urgent], ["Walk-in making weird noise", "new", 1, 0]);
-  assert.equal(repo.listEvents(db, r.job_id)[0].summary, "Details read by AI: name, problem, details, not a job?");
+  assert.equal(eventsOf(db, r.job_id)[0].summary, "Details read by AI: name, problem, details, not a job?");
   assert.equal(outcomesFor(jv, { suggestion: "not_a_job", now: A, tz: TZ })[0].label, "Not a job?");
 });
 
@@ -514,7 +529,7 @@ test("auto-ack: when on, one simulated text per number per 12 hours, never for f
   assert.equal(closeAndText(at("2026-10-05", "07:30")).status, "created_job");
   assert.equal(count(db, "outbox"), 1);
   ingestAt(db, sms("+13125550100", "Fwd: From Gus (312) 555-0174: need a price on a door"), A);
-  ingestAt(db, fromTwilioVoice({ CallSid: "CA_ans", From: "+13125550168", CallStatus: "completed", CallDuration: "60" }), A);
+  ingestAt(db, answered("CA_ans", "+13125550168", 60), A);
   assert.equal(count(db, "outbox"), 1);
   // More than 12 hours after the first: acknowledged again.
   closeAndText(at("2026-10-05", "18:31"));
@@ -550,7 +565,7 @@ test("Quick Add: the demo text becomes an urgent job with a 'manual' message hol
   assert.equal(bucketFor(jv, ctxAt(db, A)), "emergency");
   const msg = repo.getMessage(db, r.message_id);
   assert.deepEqual([msg.channel, msg.provider, msg.body, msg.status, msg.job_id], ["manual", "app", text, "created_job", r.job_id]);
-  const [created] = repo.listEvents(db, r.job_id);
+  const [created] = eventsOf(db, r.job_id);
   assert.deepEqual([created.actor, created.summary], ["denise", "Added by you"]);
 });
 
@@ -576,7 +591,7 @@ test("Quick Add: starting stages go through enterStage; her moves are due now", 
   const quote = ingestManual(db, { text: "Harbor Grill reach-in needs a quote 312-555-0125", stage: "quote" }, { now: A });
   const qjob = repo.getJobView(db, quote.job_id);
   assert.deepEqual([qjob.stage, qjob.next_due_at, bucketFor(qjob, ctx)], ["quote", A, "quote"]);
-  assert.equal(repo.listEvents(db, quote.job_id)[0].summary, "Added by you - Waiting on quote");
+  assert.equal(eventsOf(db, quote.job_id)[0].summary, "Added by you - Waiting on quote");
 
   const yes = ingestManual(db, { text: "Fresh Mart ice machine", stage: "to_schedule", tech: "Dee" }, { now: A });
   const yjob = repo.getJobView(db, yes.job_id);
@@ -603,7 +618,7 @@ test("Quick Add: starting stages go through enterStage; her moves are due now", 
     (err) => err instanceof IngestError && err.code === "validation");
 });
 
-test("Quick Add: an existing customer gets a new job (never attached), matched_customer true, blanks filled", () => {
+test("Quick Add: without attach_to_job_id an existing customer gets a new job, matched_customer true, blanks filled", () => {
   const db = freshDb();
   const jobId = rosaWaitingYes(db);
   const r = ingestManual(db, { text: "Rosa's Taqueria 312-555-0118 ice machine cleaning", fields: { address: "3540 W 26th St" } }, { now: A });
@@ -636,7 +651,7 @@ test("Brain dump: notebook rows B1-B5 become jobs at their parsed stages", () =>
   assert.ok(jobs.every((j) => j.source === "bulk"));
   const ctx = ctxAt(db, A);
   assert.deepEqual(jobs.map((j) => bucketFor(j, ctx)), ["nudge", "to_schedule", "quote", null, "new"]);
-  assert.equal(repo.listEvents(db, created[1])[0].summary, "Added from your notebook - Said yes - needs scheduling");
+  assert.equal(eventsOf(db, created[1])[0].summary, "Added from your notebook - Said yes - needs scheduling");
   assert.deepEqual(all(db, "SELECT DISTINCT channel, status FROM messages"), [{ channel: "bulk", status: "created_job" }]);
 });
 
@@ -660,4 +675,170 @@ test("invariant: every job ingest creates is open with a next date, and every me
     assert.equal(["done", "lost"].includes(job.stage), job.next_due_at == null);
   }
   assert.equal(repo.unlinkedMessageCount(db), 0);
+});
+
+// ---------------------------------------------------------------------------
+// Calls: one CallSid, one outcome (C3: intake RT-3, RT-7, RT-13, UX-10)
+
+test("calls: an ignored row keeps its CallSid; only a voicemail or a first outcome reopens it", () => {
+  const db = freshDb();
+  // Phase 2: picked up for 8 s, then the parent status callback (30 s with ring time).
+  const short = ingestAt(db, answered("CA_f", "+13125557006", 8), A);
+  const parent = ingestAt(db, fromTwilioVoice({ CallSid: "CA_f", From: "+13125557006", CallStatus: "completed", CallDuration: "30" }), A);
+  assert.deepEqual([short.status, parent.status, parent.message_id], ["ignored", "duplicate", short.message_id]);
+  assert.equal(repo.getMessage(db, short.message_id).external_id, "CA_f");
+  // A recording for the same short call still becomes a voicemail job.
+  const vm = ingestAt(db, fromTwilioVoice({ CallSid: "CA_f", From: "+13125557006", RecordingUrl: "https://example.test/rec" }), A);
+  assert.deepEqual([vm.status, vm.message_id, repo.getJobRow(db, vm.job_id).source_detail], ["created_job", short.message_id, "voicemail"]);
+  assert.equal(count(db, "messages"), 1);
+
+  // Phase 1: seen ringing, then the caller hung up during the greeting.
+  const ringing = ingestAt(db, fromTwilioVoice({ CallSid: "CA_c", From: "+13125557003", CallStatus: "ringing" }), at("2026-10-05", "06:50"));
+  const hungUp = ingestAt(db, fromTwilioVoice({ CallSid: "CA_c", From: "+13125557003", CallStatus: "completed", CallDuration: "9" }), A);
+  assert.deepEqual([ringing.status, hungUp.status, hungUp.message_id], ["ignored", "created_job", ringing.message_id]);
+  const job = repo.getJobRow(db, hungUp.job_id);
+  assert.deepEqual([job.source_detail, job.created_at], ["missed", at("2026-10-05", "06:50")]);
+});
+
+test("timeline: a call on an open job reads by its outcome, and a later voicemail relabels it (RT-13)", () => {
+  const db = freshDb();
+  const jobId = midwayQuote(db);
+  ingestAt(db, answered("CA_g1", "+13125550174", 130), at("2026-10-05", "06:00"));
+  assert.equal(eventsOf(db, jobId)[0].summary, "You talked 2 min - what happened?");
+  ingestAt(db, fromTwilioVoice({ CallSid: "CA_g2", From: "+13125550174", CallStatus: "no-answer" }), A);
+  assert.equal(eventsOf(db, jobId)[0].summary, "Called (missed, no voicemail)");
+  ingestAt(db, fromTwilioVoice({ CallSid: "CA_g2", From: "+13125550174",
+    TranscriptionText: "Denise it's Gus, the whole walk-in freezer is down and we're losing product" }), A);
+  const [inbound] = eventsOf(db, jobId);
+  assert.equal(inbound.summary, "Left a voicemail");
+  assert.equal(repo.getJobRow(db, jobId).urgent, 1);
+});
+
+// ---------------------------------------------------------------------------
+// Who a lead is (C4)
+
+const email = (from, text, extra = {}) => fromGeneric("email", { from, text, ...extra });
+
+test("identity: a phone that matches nobody never falls back to an email match", () => {
+  const db = freshDb();
+  const tony = ingestAt(db, email("Frostline Website <forms@frostline.example>", "Name: Tony Russo\nPhone: (312) 555-0187\nMessage: Walk-in freezer at 10F"), A);
+  const uma = ingestAt(db, email("Frostline Website <forms@frostline.example>", "Name: Uma Patel\nPhone: (312) 555-0186\nMessage: Reach-in not cooling"), A);
+  assert.deepEqual([tony.status, uma.status], ["created_job", "created_job"]);
+  assert.notEqual(tony.customer_id, uma.customer_id);
+  assert.deepEqual([repo.getCustomer(db, uma.customer_id).phone, repo.getCustomer(db, uma.customer_id).email], ["+13125550186", null]);
+  // A plain email from a known customer's own address still finds them.
+  const nora = repo.createCustomer(db, { business_name: "Lakeview Brewing Co.", email: "nora@lakeviewbrewing.example" }, A);
+  assert.equal(ingestAt(db, email("Nora <nora@lakeviewbrewing.example>", "The keg cooler is warm again"), A).customer_id, nora.id);
+});
+
+test("identity: owner_email and relay senders are never stored as a customer's email", () => {
+  const db = freshDb({ owner_email: "denise@frostline.example" });
+  const own = ingestAt(db, email("Denise <Denise@Frostline.example>", "Harbor Grill reach-in is warm, 312-555-0125"), A);
+  const relay = ingestAt(db, email("Wix Forms <no-reply@crm.wix.com>", "New message: our display case is warm, 312-555-7201"), A);
+  const replyTo = ingestAt(db, email("Wix Forms <no-reply@crm.wix.com>", "New message: freezer at 20 degrees", { reply_to: "Carla Diaz <carla@diaz.example>" }), A);
+  assert.deepEqual([own, relay].map((r) => repo.getCustomer(db, r.customer_id).email), [null, null]);
+  const carla = repo.getCustomer(db, replyTo.customer_id);
+  assert.deepEqual([carla.email, carla.contact_name], ["carla@diaz.example", "Carla Diaz"]);
+  // A forwarded email (Fwd: subject) is not from the customer either.
+  const fwd = ingestAt(db, email("Ann <ann@relay.example>", "Our walk-in is warm 312-555-0181", { subject: "Fwd: walk-in" }), A);
+  assert.equal(repo.getCustomer(db, fwd.customer_id).email, null);
+});
+
+test("identity: an injected address is dropped at ingest (security RT-4)", () => {
+  const db = freshDb();
+  const r = ingest(db, { ...email("Chef Bo <chef@bistro.example>", "Our walk-in freezer is warm"),
+    from_email: "chef@bistro.example?cc=billing@attacker.example", received_at: A }, { now: A, ai: false });
+  assert.deepEqual([repo.getMessage(db, r.message_id).from_email, repo.getCustomer(db, r.customer_id).email], [null, null]);
+});
+
+test("Quick Add identity: a pasted form email is the person in it, and a typed phone that contradicts a match makes a new customer (RT-2)", () => {
+  const db = freshDb();
+  const paste = (name, business, phone, message) => ({
+    text: `From: Frostline Website <forms@frostline.example>\nSubject: New form submission\n\nName: ${name}\nBusiness: ${business}\nPhone: ${phone}\nMessage: ${message}`,
+  });
+  const tony = ingestManual(db, paste("Tony Russo", "Tony's Bistro", "(312) 555-0187", "Walk-in freezer at 10F and rising."), { now: A });
+  const uma = ingestManual(db, paste("Uma Patel", "Uma's Bakery", "(312) 555-0186", "Reach-in not cooling."), { now: A });
+  assert.notEqual(tony.customer_id, uma.customer_id);
+  assert.deepEqual([repo.getCustomer(db, uma.customer_id).business_name, repo.getCustomer(db, uma.customer_id).phone],
+    ["Uma's Bakery", "+13125550186"]);
+
+  // Matched by email, but the phone she typed is not that customer's: a new customer.
+  const rosa = repo.createCustomer(db, { business_name: "Rosa's Taqueria", phone: "+13125550118", email: "rosa@taqueria.example" }, A);
+  const typed = ingestManual(db, { text: "rosa@taqueria.example walk-in noise", fields: { phone: "555-0186" } }, { now: A });
+  assert.notEqual(typed.customer_id, rosa.id);
+  const same = ingestManual(db, { text: "rosa@taqueria.example walk-in noise", fields: { phone: "(312) 555-0118" } }, { now: A });
+  assert.equal(same.customer_id, rosa.id);
+});
+
+// ---------------------------------------------------------------------------
+// Quick Add on an open job (C5: intake RT-5)
+
+test("Quick Add with attach_to_job_id adds the pasted text to that open job as the customer's message", () => {
+  const db = freshDb();
+  const jobId = midwayQuote(db);
+  const text = "Gus (312) 555-0174: hey denise any update on that freezer door quote? the door is leaking now";
+  const r = ingestManual(db, { text, attach_to_job_id: jobId, fields: { phone: "+13125550174" } }, { now: A });
+  assert.deepEqual([r.status, r.job_id, r.matched_customer, r.refine], ["attached", jobId, true, null]);
+  assert.equal(count(db, "jobs"), 1);
+  const jv = repo.getJobView(db, jobId);
+  assert.deepEqual([jv.stage, jv.unread_inbound_at, jv.urgent, jv.urgent_source], ["quote", A, 1, "rules"]);
+  const msg = repo.getMessage(db, r.message_id);
+  assert.deepEqual([msg.channel, msg.status, msg.job_id, msg.body], ["manual", "attached", jobId, text]);
+  const [inbound] = eventsOf(db, jobId);
+  assert.deepEqual([inbound.kind, inbound.actor, inbound.summary, inbound.message_id], ["inbound", "customer", "You pasted in their message", r.message_id]);
+  assert.equal(bucketFor(jv, ctxAt(db, A)), "emergency");
+
+  // A second paste keeps the first unread time.
+  ingestManual(db, { text: "also the gasket is torn", attach_to_job_id: String(jobId) }, { now: at("2026-10-05", "08:00") });
+  assert.equal(repo.getJobRow(db, jobId).unread_inbound_at, A);
+
+  const invalid = (input, message) => assert.throws(() => ingestManual(db, input, { now: A }),
+    (err) => err instanceof IngestError && err.code === "validation" && err.message === message);
+  invalid({ text: "", attach_to_job_id: jobId }, "Paste their message first.");
+  invalid({ text: "hi", attach_to_job_id: 999 }, "That job is closed now. Add this as a new job.");
+  repo.updateJob(db, jobId, { stage: "lost", lost_reason: "price", next_due_at: null, closed_at: A, updated_at: A });
+  invalid({ text: "hi", attach_to_job_id: jobId }, "That job is closed now. Add this as a new job.");
+});
+
+test("Quick Add validation: a phone that isn't a phone number doesn't count (C5)", () => {
+  const db = freshDb();
+  assert.throws(() => ingestManual(db, { text: "", fields: { phone: "555-01" } }, { now: A }),
+    (err) => err instanceof IngestError && err.message === VALIDATION_MESSAGE);
+  assert.equal(ingestManual(db, { text: "", fields: { phone: "(312) 555-0101" } }, { now: A }).status, "created_job");
+});
+
+// ---------------------------------------------------------------------------
+// Brain dump rows (C6)
+
+test("Brain dump: rows are history, not wins; edited phone and urgent are kept; a callback day puts a new row off", () => {
+  const db = freshDb();
+  const { created, errors } = ingestBulk(db, [
+    { line: "Fresh Mart ice machine needs scheduling", fields: { business_name: "Fresh Mart", problem: "Ice machine" }, stage: "to_schedule" },
+    { line: "Rosa's Taqueria walk-in done, $2,400", fields: { business_name: "Rosa's Taqueria" }, stage: "done", quote_amount: 2400 },
+    { line: "Marie 555-0122 reach in warm", fields: { contact_name: "Marie", problem: "Reach in warm", phone: "(312) 555-0122", urgent: false }, stage: "new" },
+    { line: "Golden Wok ice machine, call back thursday", fields: { business_name: "Golden Wok", problem: "Ice machine" }, stage: "new", callback_date: "2026-10-08" },
+    { line: "Harbor Grill, call back today", fields: { business_name: "Harbor Grill" }, stage: "new", callback_date: "2026-10-05" },
+  ], { now: A });
+  assert.deepEqual(errors, []);
+  const [toSchedule, done, marie, wok, harbor] = created.map((id) => repo.getJobView(db, id));
+  assert.deepEqual([toSchedule.won_at, toSchedule.next_due_at], [null, A]);
+  assert.deepEqual([done.stage, done.won_at, done.done_at, done.quote_amount, done.closed_at], ["done", null, null, 2400, A]);
+  assert.deepEqual([marie.customer.phone, marie.urgent, marie.urgent_source], ["+13125550122", 0, null]);
+  assert.deepEqual([wok.snoozed_until, wok.next_due_at], [startOfDay("2026-10-08", TZ), startOfDay("2026-10-08", TZ)]);
+  assert.deepEqual([harbor.snoozed_until, harbor.next_due_at], [null, A], "a callback day that isn't in the future is due now");
+});
+
+// ---------------------------------------------------------------------------
+// Automatic acknowledgement limits (security RT-7)
+
+test("auto-ack: never to toll-free or premium numbers, and at most 20 an hour in all", () => {
+  const db = freshDb({ auto_ack_enabled: true });
+  for (const phone of ["(900) 555-0111", "(976) 555-0112", "(800) 555-0113", "(888) 555-0114"]) {
+    ingestAt(db, fromForm({ name: "X", phone, message: "need quote" }), A);
+  }
+  assert.equal(count(db, "outbox"), 0);
+  for (let i = 0; i < 21; i++) ingestAt(db, sms(`+1312555${String(2000 + i)}`, "walk-in is warm"), A);
+  assert.equal(count(db, "outbox"), 20);
+  ingestAt(db, sms("+13125553000", "walk-in is warm"), at("2026-10-05", "08:01"));
+  assert.equal(count(db, "outbox"), 21, "an hour later the cap has room again");
 });

@@ -117,7 +117,7 @@ export function openDb(path = process.env.DB_PATH || "data/callback.db") {
 }
 
 /** Bring the schema up to SCHEMA_VERSION. Each step runs in its own transaction. */
-export function migrate(db) {
+function migrate(db) {
   let version = get(db, "PRAGMA user_version").user_version;
   while (version < MIGRATIONS.length) {
     const target = version + 1;

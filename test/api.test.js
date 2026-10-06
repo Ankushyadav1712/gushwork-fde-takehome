@@ -13,13 +13,13 @@ import * as repo from "../server/repo.js";
 import * as clock from "../server/clock.js";
 import { createApp } from "../server/app.js";
 import { seedDemo } from "../server/seed.js";
-import { ingestManual } from "../server/ingest.js";
+import { ingest, ingestManual } from "../server/ingest.js";
 import { twilioSignature } from "../server/adapters.js";
 import { addMinutes } from "../shared/time.js";
+import { messagesOf, outboxRow } from "./fixtures/history.js";
 
 process.env.AI_PARSING = "off";
 const A = "2026-10-05T12:00:00.000Z"; // Mon Oct 5 2026 07:00 America/Chicago
-const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const servers = [];
 after(() => {
   for (const s of servers) s.close();
@@ -27,11 +27,11 @@ after(() => {
 });
 
 /** A seeded (or empty) database behind createApp, listening on port 0. */
-async function start({ env = {}, now = () => A, seed = true, extract, twilioFetch } = {}) {
+async function start({ env = {}, now = () => A, seed = true, extract, twilioFetch, publicUrl } = {}) {
   const db = openDb(":memory:");
   if (seed) seedDemo(db, { anchor: A, env: {} });
   else repo.ensureSettings(db);
-  const app = createApp({ db, now, env, extract, fetch: twilioFetch });
+  const app = createApp({ db, now, env, extract, fetch: twilioFetch, publicUrl });
   const server = await new Promise((resolve) => {
     const s = app.listen(0, "127.0.0.1", () => resolve(s));
   });
@@ -59,6 +59,12 @@ async function start({ env = {}, now = () => A, seed = true, extract, twilioFetc
 
 const errorOf = (res) => [res.status, res.json?.error?.code];
 const cards = (today) => today.sections.flatMap((s) => s.items);
+const TWILIO_ENV = { TWILIO_ACCOUNT_SID: "ACtest", TWILIO_AUTH_TOKEN: "authtok", TWILIO_FROM: "+13125550105" };
+
+/** A Twilio Messages API stand-in that answers every send with one status. */
+function twilioAnswering(status, body = {}) {
+  return async () => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+}
 
 // ---------------------------------------------------------------------------
 // Outcomes, stage moves, undo
@@ -210,6 +216,77 @@ test("stage moves: enterStage, not contact; Bring back; errors", async () => {
   assert.equal(scheduled.json.job.next_due_at, "2026-10-09T05:00:00.000Z");
 });
 
+test("regression RT-2 (C7): 'Needs a quote for more work' closes the visit and opens a new quote job", async () => {
+  const api = await start();
+  const before = (await api.get("/api/numbers")).json;
+  const res = await api.post("/api/jobs/10/outcome", { outcome: "need_quote", expected_stage: "scheduled" });
+  assert.equal(res.status, 200);
+  assert.equal(res.json.toast, "Marked done. The extra work is a new job waiting on your quote.");
+  assert.deepEqual([res.json.job.stage, res.json.spawned_job_id], ["done", 19]);
+  const extra = (await api.get("/api/jobs/19")).json;
+  assert.deepEqual([extra.job.stage, extra.job.title, extra.job.problem, extra.job.source_label, extra.job.customer_id],
+    ["quote", "Sal's Pizza", "More work: Prep table cooler fan grinding", "Added by you", res.json.job.customer_id]);
+  assert.deepEqual(extra.timeline.map((t) => [t.kind, t.summary]), [["created", "Extra work found at the Fri visit"]]);
+  assert.equal((await api.post("/api/jobs/19/outcome", { outcome: "quote_sent", amount: 2400 })).status, 200);
+  const after = (await api.get("/api/numbers")).json;
+  assert.deepEqual([after.waiting_yes_total, after.won_30d_count, after.won_30d_total, after.done_7d_count],
+    [before.waiting_yes_total + 2400, before.won_30d_count, before.won_30d_total, before.done_7d_count + 1]);
+  assert.equal((await api.post("/api/jobs/16/outcome", { outcome: "no_answer" })).json.spawned_job_id, null);
+});
+
+test("C7 undo of 'more work' restores the visit and removes the new job, unless she has worked on it", async () => {
+  const api = await start();
+  const visit = repo.getJobRow(api.db, 10);
+  const first = await api.post("/api/jobs/10/outcome", { outcome: "need_quote" });
+  assert.equal((await api.post("/api/jobs/10/undo", { event_id: first.json.event_id })).status, 200);
+  assert.deepEqual(repo.getJobRow(api.db, 10), { ...visit, updated_at: repo.getJobRow(api.db, 10).updated_at });
+  assert.equal(repo.getJobRow(api.db, first.json.spawned_job_id), null);
+  assert.equal(get(api.db, "SELECT count(*) AS n FROM events WHERE job_id = ?", [first.json.spawned_job_id]).n, 0);
+
+  const again = await api.post("/api/jobs/10/outcome", { outcome: "need_quote" });
+  await api.post(`/api/jobs/${again.json.spawned_job_id}/outcome`, { outcome: "quote_sent", amount: 900 });
+  assert.equal((await api.post("/api/jobs/10/undo", { event_id: again.json.event_id })).json.job.stage, "scheduled");
+  assert.equal(repo.getJobRow(api.db, again.json.spawned_job_id).stage, "waiting_yes", "her quote stays");
+});
+
+test("regression CC-4 (C8): undo after a late AI read keeps what the AI read", async () => {
+  const api = await start({ seed: false });
+  let finishRead;
+  const reading = new Promise((resolve) => { finishRead = resolve; });
+  const extract = async () => {
+    await reading;
+    return {
+      contact_name: "Dan", business_name: null, phone: null, email: null, address: null, equipment: "walk_in_freezer",
+      summary: "Walk-in freezer down, food thawing", details: null, urgency: "emergency", urgency_reason: "food thawing",
+      is_service_request: true, parsed_by: "ai",
+    };
+  };
+  const lead = ingest(api.db, {
+    channel: "sms", provider: "twilio", external_id: "SMdan", received_at: A, from_phone: "+13125550666",
+    body: "hey its dan, deli on main. freezer quit on us",
+  }, { now: A, extract });
+  assert.equal(repo.getJobRow(api.db, lead.job_id).urgent, 0, "the rules didn't see an emergency");
+  const tried = await api.post(`/api/jobs/${lead.job_id}/outcome`, { outcome: "no_answer", expected_stage: "new" });
+  finishRead();
+  await lead.refine;
+  assert.equal(repo.getJobRow(api.db, lead.job_id).urgent, 1);
+  const undone = await api.post(`/api/jobs/${lead.job_id}/undo`, { event_id: tried.json.event_id });
+  assert.equal(undone.status, 200);
+  assert.deepEqual([undone.json.job.urgent, undone.json.job.problem, undone.json.job.attempts, undone.json.job.bucket],
+    [1, "Walk-in freezer down, food thawing", 0, "emergency"]);
+  assert.deepEqual(repo.getEvent(api.db, tried.json.event_id).data.changed_keys.sort(),
+    ["attempts", "first_touch_at", "last_touch_at", "next_due_at"], "only what the outcome changed");
+});
+
+test("regression RT-3: a lead wrongly marked Not a job, then moved to Done, counts as done", async () => {
+  const api = await start();
+  await api.post("/api/jobs/17/outcome", { outcome: "not_a_job" });
+  const done = await api.post("/api/jobs/17/stage", { to: "done", amount: 350 });
+  assert.deepEqual([done.json.job.stage, done.json.job.lost_reason, done.json.job.lost_reason_label, done.json.job.lost_at],
+    ["done", null, null, null]);
+  assert.equal((await api.get("/api/numbers")).json.done_7d_count, 2);
+});
+
 test("tap logs history only (204), including Text a tech", async () => {
   const api = await start();
   const row = repo.getJobRow(api.db, 16);
@@ -258,14 +335,14 @@ test("GET /api/jobs/:id: job, customer, timeline, outcomes, links, past jobs", a
   assert.deepEqual([harbor.job.bucket, harbor.job.on_today, harbor.job.back_on_list], ["replied", true, null]);
   assert.equal(harbor.job.reason, "Texted yesterday 6:05pm: \"Can Mike come Wednesday instead of Tuesday? We're closed…\"");
   assert.deepEqual(harbor.outcomes.map((b) => b.label),
-    ["Moved to another day", "Done", "Needs another visit", "Needs a quote for more work", "Seen it", "Not today", "Cancelled"]);
+    ["Move to Wednesday?", "Done", "Needs another visit", "Needs a quote for more work", "Seen it", "Not today", "Cancelled"]);
   assert.deepEqual(harbor.timeline.slice(0, 2).map((t) => `${t.at_label} · ${t.summary}`), [
     "Mon 7:00am · In your morning text",
-    "Sun 6:05pm · Texted: Can Mike come Wednesday instead of Tuesday? We're closed Tuesdays.",
+    "Sun 6:05pm · Texted back",
   ]);
   assert.deepEqual(harbor.timeline[1], {
     id: harbor.timeline[1].id, at: "2026-10-04T23:05:00.000Z", at_label: "Sun 6:05pm", actor: "customer", kind: "inbound",
-    summary: "Texted: Can Mike come Wednesday instead of Tuesday? We're closed Tuesdays.",
+    summary: "Texted back",
     channel: "sms", body: "Can Mike come Wednesday instead of Tuesday? We're closed Tuesdays.", undone: false,
   });
   assert.equal(harbor.tel_link, "tel:+13125550125");
@@ -315,6 +392,7 @@ test("PATCH /api/jobs/:id: edits log one event; urgent is manual; validation and
   assert.deepEqual(errorOf(await api.patch("/api/jobs/12", { visit_date: null })), [400, "validation"]);
   assert.deepEqual(errorOf(await api.patch("/api/jobs/12", { visit_date: "Thursday" })), [400, "validation"]);
   assert.deepEqual(errorOf(await api.patch("/api/jobs/15", { email: "not-an-email" })), [400, "validation"]);
+  assert.deepEqual(errorOf(await api.patch("/api/jobs/15", { email: "sam@diner.example?bcc=spy@x.example" })), [400, "validation"]);
   assert.deepEqual(errorOf(await api.patch("/api/jobs/15", { phone: "12345" })), [400, "validation"]);
   assert.deepEqual(errorOf(await api.patch("/api/jobs/15", { equipment: "toaster" })), [400, "validation"]);
   assert.deepEqual(errorOf(await api.patch("/api/jobs/15", { colour: "red" })), [400, "validation"]);
@@ -328,6 +406,24 @@ test("PATCH /api/jobs/:id: edits log one event; urgent is manual; validation and
   const customer = repo.getCustomer(api.db, undo.json.job.customer_id);
   assert.deepEqual([customer.phone, customer.email], ["+13125550177", null]);
   assert.equal(undo.json.job.quote_amount, null);
+});
+
+test("regression requirements RT-2: a new phone on a customer with another open job never rewrites that job", async () => {
+  const api = await start();
+  const first = await api.post("/api/jobs", { text: "Tony's Bistro walk-in freezer at 10F", fields: { phone: "(312) 555-0187" } });
+  const second = await api.post("/api/jobs", { text: "Tony's Bistro reach-in not cooling", fields: { phone: "(312) 555-0187" } });
+  assert.equal(second.json.customer_id, first.json.customer_id, "the same phone is the same customer");
+
+  const fixed = await api.patch(`/api/jobs/${second.json.job_id}`, { phone: "(312) 555-0186" });
+  assert.equal(fixed.status, 200);
+  assert.notEqual(fixed.json.job.customer_id, first.json.customer_id, "this job now has its own customer");
+  assert.deepEqual([fixed.json.job.title, fixed.json.job.phone], ["Tony's Bistro", "+13125550186"]);
+  const other = repo.getJobView(api.db, first.json.job_id);
+  assert.deepEqual([other.customer_id, other.customer.phone], [first.json.customer_id, "+13125550187"]);
+
+  const renamed = await api.patch(`/api/jobs/${second.json.job_id}`, { business_name: "Uma's Bakery" });
+  assert.equal(renamed.json.job.title, "Uma's Bakery");
+  assert.equal(repo.getJobView(api.db, first.json.job_id).customer.business_name, "Tony's Bistro");
 });
 
 // ---------------------------------------------------------------------------
@@ -344,7 +440,7 @@ test("R04 Quick Add: POST /api/jobs creates an urgent job from one line; validat
   const urgent = (await api.get("/api/today")).json.sections[0];
   assert.equal(urgent.label, "Urgent - call first");
   assert.deepEqual(urgent.items.map((c) => [c.job_id, c.title, c.source_label]), [[16, "Bella Cucina", "Voicemail"], [19, "(555) 444-1212", "Added by you"]]);
-  assert.equal(repo.messagesForJob(api.db, 19)[0].body, "555-444-1212 ice machine leaking");
+  assert.equal(messagesOf(api.db, 19)[0].body, "555-444-1212 ice machine leaking");
 
   const repeat = await api.post("/api/jobs", { text: "Rosa's ice machine again", fields: { phone: "(312) 555-0118" } });
   assert.equal(repeat.json.matched_customer, true);
@@ -367,7 +463,13 @@ test("POST /api/parse: rules, AI (injected), matched customer", async () => {
   assert.ok(dave.json.urgent_hits.length > 0);
   assert.equal(dave.json.matched_customer, null);
   const rosa = await api.post("/api/parse", { text: "Rosa called from 312-555-0118 about the cooler again" });
-  assert.deepEqual(rosa.json.matched_customer, { id: repo.findCustomerByPhone(api.db, "+13125550118").id, title: "Rosa's Taqueria", past_jobs: 2 });
+  assert.deepEqual(rosa.json.matched_customer, {
+    id: repo.findCustomerByPhone(api.db, "+13125550118").id, title: "Rosa's Taqueria", match: "phone", past_jobs: 1,
+    open_job: {
+      id: 7, title: "Rosa's Taqueria", stage: "waiting_yes", stage_label: "Waiting on their yes",
+      problem: "Walk-in cooler compressor short cycling", quote_amount: 2400,
+    },
+  });
   const hint = await api.post("/api/parse", { text: "Dave from Hillside Grocery wants a quote on a new ice machine 312-555-0199" });
   assert.equal(hint.json.stage_hint, "quote");
   assert.equal(hint.json.matched_customer.title, "Hillside Grocery");
@@ -394,6 +496,48 @@ test("POST /api/parse: rules, AI (injected), matched customer", async () => {
   assert.deepEqual([fallback.status, fallback.json.mode, fallback.json.fields.business_name], [200, "rules", "Dave's Deli"]);
   assert.equal(calls.length, 1);
   assert.equal((await ai.get("/api/health")).json.ai, "claude");
+});
+
+test("C5 previews match a repeat customer by phone, or by email only when no phone was given", async () => {
+  const api = await start();
+  const byEmail = await api.post("/api/parse", { text: "Nora from the brewery, tbecker@northsidecold.example, freezer fans again" });
+  assert.deepEqual([byEmail.json.matched_customer.title, byEmail.json.matched_customer.match, byEmail.json.matched_customer.past_jobs],
+    ["Northside Cold Storage", "email", 0]);
+  assert.equal(byEmail.json.matched_customer.open_job.id, 5);
+  const otherPhone = await api.post("/api/parse", { text: "tbecker@northsidecold.example 312-555-0444 freezer fans" });
+  assert.equal(otherPhone.json.matched_customer, null, "a phone that matches nobody is a new customer");
+  await api.put("/api/settings", { owner_email: "Denise@Frostline.example" });
+  const own = await api.post("/api/parse", { text: "denise@frostline.example ice machine for the new place" });
+  assert.equal(own.json.matched_customer, null);
+  const joes = await api.post("/api/parse", { text: "Joe's Diner 312-555-0160 gasket again" });
+  assert.deepEqual([joes.json.matched_customer.past_jobs, joes.json.matched_customer.open_job.stage], [1, "to_schedule"]);
+});
+
+test("C5 Quick Add onto her open job: the text becomes the customer's message on it", async () => {
+  const api = await start();
+  const res = await api.post("/api/jobs", { text: "Rosa says go ahead with the compressor", attach_to_job_id: 7 });
+  assert.equal(res.status, 201);
+  assert.deepEqual(res.json, {
+    job_id: 7, customer_id: repo.getJobRow(api.db, 7).customer_id, attached: true, toast: "Added to Rosa's Taqueria's open job.",
+  });
+  assert.equal(get(api.db, "SELECT count(*) AS n FROM jobs").n, 18, "no new job");
+  assert.ok(repo.getJobRow(api.db, 7).unread_inbound_at);
+  const junk = await api.post("/api/jobs", { fields: { phone: "555-12" } });
+  assert.deepEqual(errorOf(junk), [400, "validation"]);
+  assert.equal(junk.json.error.message, "Add a name, a phone number, or what's wrong.");
+});
+
+test("regression RT-4 (C6): a Brain dump backlog is not this week's new, won or done work", async () => {
+  const api = await start();
+  const before = (await api.get("/api/numbers")).json;
+  const lines = ["Corner Deli walk-in noisy", "Bay Cafe said yes on the ice machine", "Hilltop Market reach-in cleaning done"];
+  const rows = lines.map((line, i) => ({ line, fields: { business_name: line.split(" ").slice(0, 2).join(" "), problem: line },
+    stage: ["new", "to_schedule", "done"][i] }));
+  assert.equal((await api.post("/api/bulk", { rows })).status, 201);
+  const after = (await api.get("/api/numbers")).json;
+  assert.deepEqual([after.new_7d_count, after.won_30d_count, after.done_7d_count],
+    [before.new_7d_count, before.won_30d_count, before.done_7d_count]);
+  assert.equal((await api.get("/api/today")).json.footer.last24h_text, "Last 24 hours: 1 came in, 1 not called yet");
 });
 
 test("R22 Brain dump: /api/bulk/parse reads B1-B5, /api/bulk creates 5 jobs at their stages", async () => {
@@ -430,7 +574,7 @@ test("digest preview and send; outbox and messages lists", async () => {
   const preview = (await api.get("/api/digest/preview")).json;
   assert.equal(preview.now, A);
   assert.equal(preview.digest.send, true);
-  assert.equal(preview.digest.body, repo.outboxByDedupe(api.db, "digest:2026-10-05").body);
+  assert.equal(preview.digest.body, outboxRow(api.db, "digest:2026-10-05").body);
   assert.equal(preview.sweep, "Before the weekend: 8 people still waiting on you - Bella Cucina, Harbor Grill, (312) 555-0177, +5 more. Open: http://localhost:3000/#/");
   const sent = await api.post("/api/digest/send");
   assert.equal(sent.status, 200);
@@ -445,12 +589,26 @@ test("digest preview and send; outbox and messages lists", async () => {
   assert.equal((await api.get("/api/messages")).json.items.length, 19);
 });
 
+test("regression CC-5 (C10): Send now says what happened to the text; Today flags texts that don't go out", async () => {
+  const simulated = await start();
+  const ok = await simulated.post("/api/digest/send");
+  assert.deepEqual([ok.status, ok.json.status, ok.json.error, typeof ok.json.outbox_id], [200, "simulated", null, "number"]);
+  assert.equal((await simulated.get("/api/today")).json.texts_failing, false);
+
+  const refused = await start({ env: TWILIO_ENV, twilioFetch: twilioAnswering(401, { code: 20003, message: "Authenticate" }) });
+  const failed = await refused.post("/api/digest/send");
+  assert.deepEqual([failed.json.status, failed.json.error], ["failed", "Twilio 401 (code 20003): Authenticate"]);
+  assert.equal((await refused.get("/api/today")).json.texts_failing, true);
+  const sent = await start({ env: TWILIO_ENV, twilioFetch: twilioAnswering(201, { sid: "SM1" }) });
+  assert.deepEqual([(await sent.post("/api/digest/send")).json.status, (await sent.get("/api/today")).json.texts_failing], ["sent", false]);
+});
+
 test("GET /api/health", async () => {
   const api = await start();
   const health = (await api.get("/api/health")).json;
   const { clock_offset_ms: offset, ...rest } = health;
   assert.deepEqual(rest, {
-    ok: true, now: A, tz: "America/Chicago", ai: "rules", ai_model: "claude-opus-5-5", sms: "simulated",
+    ok: true, now: A, tz: "America/Chicago", ai: "rules", ai_model: "claude-sonnet-5-5", sms: "simulated",
     demo: true, passcode: false, unlinked_messages: 0,
   });
   assert.equal(typeof offset, "number");
@@ -461,11 +619,11 @@ test("settings: GET shape, PUT validation and normalisation, link regeneration",
   const api = await start();
   const s = (await api.get("/api/settings")).json;
   assert.equal(s.company_name, "Frostline Refrigeration");
-  assert.deepEqual(s.integrations, { ai: "rules", ai_model: "claude-opus-5-5", sms: "simulated", passcode: false, inbound_token: false });
+  assert.deepEqual(s.integrations, { ai: "rules", ai_model: "claude-sonnet-5-5", sms: "simulated", passcode: false, inbound_token: false });
   assert.match(s.readonly_key, /^[A-Za-z0-9_-]{24}$/);
   assert.equal(s.readonly_url, `http://localhost:3000/n/${s.readonly_key}`);
   assert.deepEqual(s.webhook_urls, {
-    sms: "http://localhost:3000/webhooks/twilio/sms", call: "http://localhost:3000/webhooks/twilio/voice",
+    sms: "http://localhost:3000/api/inbound/sms", call: "http://localhost:3000/api/inbound/call",
     email: "http://localhost:3000/api/inbound/email", form: "http://localhost:3000/api/inbound/form",
   });
   assert.equal(s.forwarding_number, null);
@@ -482,6 +640,10 @@ test("settings: GET shape, PUT validation and normalisation, link regeneration",
     { techs: [{ name: "", phone: "3125550121" }] }, { company_name: "" }]) {
     assert.deepEqual(errorOf(await api.put("/api/settings", bad)), [400, "validation"], JSON.stringify(bad));
   }
+  assert.equal(s.owner_email, null);
+  assert.equal((await api.put("/api/settings", { owner_email: " Denise@Frostline.Example " })).json.owner_email, "denise@frostline.example");
+  assert.deepEqual(errorOf(await api.put("/api/settings", { owner_email: "denise at frostline" })), [400, "validation"]);
+  assert.equal((await api.put("/api/settings", { owner_email: "" })).json.owner_email, null);
   const ignored = await api.put("/api/settings", { readonly_key: "mine", clock_offset_ms: 5 });
   assert.equal(ignored.json.readonly_key, s.readonly_key);
 
@@ -493,7 +655,7 @@ test("settings: GET shape, PUT validation and normalisation, link regeneration",
   const wired = await start({ env: { INBOUND_TOKEN: "tok en", TWILIO_FROM: "+13125550105", PUBLIC_URL: "https://callback.example.com/" } });
   const w = (await wired.get("/api/settings")).json;
   assert.equal(w.webhook_urls.form, "https://callback.example.com/api/inbound/form?token=tok%20en");
-  assert.equal(w.webhook_urls.sms, "https://callback.example.com/webhooks/twilio/sms?token=tok%20en");
+  assert.equal(w.webhook_urls.sms, "https://callback.example.com/api/inbound/sms?token=tok%20en");
   assert.equal(w.readonly_url, `https://callback.example.com/n/${w.readonly_key}`);
   assert.equal(w.forwarding_number, "+13125550105");
   assert.equal(w.integrations.inbound_token, true);
@@ -566,12 +728,18 @@ test("T21 passcode: no cookie is 401; login sets a 180-day httpOnly cookie; heal
   const inbound = await api.post("/api/inbound/sms", { from: "+13125550188", body: "Ice machine is leaking" });
   assert.equal(inbound.status, 200);
   assert.equal(inbound.json.status, "created_job");
-  const alias = await api.post("/webhooks/form", { name: "Pat Lee", phone: "(312) 555-0187", message: "Prep table warm", submission_id: "f-1" });
-  assert.deepEqual([alias.status, alias.json.status], [200, "created_job"]);
+  const form = await api.post("/api/inbound/form", { name: "Pat Lee", phone: "(312) 555-0187", message: "Prep table warm", submission_id: "f-1" });
+  assert.deepEqual([form.status, form.json.status], [200, "created_job"]);
 
   const other = await start({ env: { APP_PASSCODE: "4321", SESSION_SECRET: "another-secret" } });
   assert.equal((await other.get("/api/today", { cookie })).status, 401, "a cookie signed with another secret fails");
   const unset = await start({ env: { APP_PASSCODE: "4321" } });
+  const restarted = createApp({ db: unset.db, now: () => A, env: { APP_PASSCODE: "4321" } });
+  const unsetCookie = (await unset.post("/api/login", { passcode: "4321" })).headers.get("set-cookie").split(";")[0];
+  const again = await new Promise((resolve) => { const s = restarted.listen(0, "127.0.0.1", () => resolve(s)); });
+  servers.push(again);
+  const afterRestart = await fetch(`http://127.0.0.1:${again.address().port}/api/today`, { headers: { cookie: unsetCookie } });
+  assert.equal(afterRestart.status, 200, "regression RT-9: without SESSION_SECRET a restart keeps her logged in");
   for (let i = 0; i < 10; i += 1) await unset.post("/api/login", { passcode: `bad${i}` });
   const limited = await unset.post("/api/login", { passcode: "4321" });
   assert.equal(limited.status, 429, "too many wrong passcodes");
@@ -587,14 +755,25 @@ test("T21 INBOUND_TOKEN: inbound without the token is 401; with it 200; Twilio s
   const signed = await start({ env: { TWILIO_AUTH_TOKEN: "authtok", PUBLIC_URL: "https://callback.example.com" } });
   const params = { MessageSid: "SMsig1", From: "+13125550189", To: "+13125550105", Body: "Freezer down", NumMedia: "0" };
   const postForm = async (headers) => {
-    const res = await fetch(`${signed.base}/webhooks/twilio/sms`, {
+    const res = await fetch(`${signed.base}/api/inbound/sms`, {
       method: "POST", headers: { "content-type": "application/x-www-form-urlencoded", ...headers }, body: new URLSearchParams(params),
     });
     return res.status;
   };
   assert.equal(await postForm({ "x-twilio-signature": "bad" }), 403);
-  const good = twilioSignature("authtok", "https://callback.example.com/webhooks/twilio/sms", params);
+  const good = twilioSignature("authtok", "https://callback.example.com/api/inbound/sms", params);
   assert.equal(await postForm({ "x-twilio-signature": good }), 200);
+});
+
+test("regression security RT-8: Twilio signatures are checked against the server's own address, not localhost:3000", async () => {
+  const api = await start({ env: { TWILIO_AUTH_TOKEN: "authtok" }, publicUrl: "http://localhost:4567" });
+  const params = { MessageSid: "SMsig2", From: "+13125550184", To: "+13125550105", Body: "Freezer down", NumMedia: "0" };
+  const postSigned = async (url) => (await fetch(`${api.base}/api/inbound/sms`, {
+    method: "POST", body: new URLSearchParams(params),
+    headers: { "content-type": "application/x-www-form-urlencoded", "x-twilio-signature": twilioSignature("authtok", url, params) },
+  })).status;
+  assert.equal(await postSigned("http://localhost:3000/api/inbound/sms"), 403);
+  assert.equal(await postSigned("http://localhost:4567/api/inbound/sms"), 200);
 });
 
 test("auto-acknowledgement (off by default) goes through notify.send into the outbox when turned on", async () => {
@@ -676,6 +855,31 @@ test("simulator clock: presets run the scheduler and persist the offset; reset r
   assert.equal((await off.get("/api/today")).json.demo.shifted, false);
 });
 
+test("C11 GET /api/sim/presets lists the demo presets", async () => {
+  const api = await start();
+  const { items } = (await api.get("/api/sim/presets")).json;
+  assert.deepEqual(items.map((p) => p.id),
+    ["rosa_yes", "lucia_repeat", "web_form_tony", "voicemail_carla", "forward_midway", "spam_call", "answered_call"]);
+  for (const p of items) {
+    assert.deepEqual(Object.keys(p), ["id", "label", "note"]);
+    assert.equal(typeof p.label, "string");
+    assert.equal(typeof p.note, "string", p.id);
+  }
+});
+
+test("regression RT-8: moving the demo clock back forgets the texts sent 'in the future'", async () => {
+  const api = await start({ now: () => clock.now().toISOString() });
+  clock.setNow(A);
+  const monday = await api.post("/api/sim/clock", { preset: "next_mon_0700" });
+  assert.ok(monday.json.sent.some((o) => o.kind === "digest"));
+  const back = addMinutes(A, 60);
+  await api.post("/api/sim/clock", { set: back });
+  assert.equal(get(api.db, "SELECT count(*) AS n FROM outbox WHERE created_at > ?", [back]).n, 0);
+  assert.equal(get(api.db, "SELECT count(*) AS n FROM events WHERE kind = 'notified' AND at > ?", [back]).n, 0);
+  const real = await api.post("/api/sim/clock", { set: "2026-10-12T12:30:00.000Z" });
+  assert.deepEqual(real.json.sent.filter((o) => o.kind === "digest").length, 1, "that Monday still gets its morning text");
+});
+
 // ---------------------------------------------------------------------------
 // Serving the app
 
@@ -730,55 +934,127 @@ test("R25 with 100 open jobs, GET /api/today answers in under 200 ms", async () 
 // ---------------------------------------------------------------------------
 // Startup (T20) and the production rule
 
-function waitForLine(child, ms = 10_000) {
-  return new Promise((resolve, reject) => {
+const SERVER = fileURLToPath(new URL("../server/index.js", import.meta.url));
+
+/**
+ * Start server/index.js from an empty folder (so no .env is read) on a free port.
+ * Resolves with {line, port, stderr()} once the startup line is printed.
+ */
+function boot(dir, env) {
+  const child = spawn(process.execPath, [SERVER], {
+    cwd: dir, env: { PATH: process.env.PATH, HOME: process.env.HOME, PORT: "0", ...env }, stdio: ["ignore", "pipe", "pipe"],
+  });
+  let err = "";
+  child.stderr.on("data", (chunk) => { err += chunk; });
+  const ready = new Promise((resolve, reject) => {
     let out = "";
-    const timer = setTimeout(() => reject(new Error(`no startup line: ${out}`)), ms);
+    const timer = setTimeout(() => reject(new Error(`no startup line: ${out}`)), 10_000);
     child.stdout.on("data", (chunk) => {
       out += chunk;
-      if (out.includes("\n")) {
-        clearTimeout(timer);
-        resolve(out);
-      }
+      if (!out.includes("\n")) return;
+      clearTimeout(timer);
+      const line = out.trimEnd();
+      resolve({ line, port: Number(/^Callback on http:\/\/localhost:(\d+) /.exec(line)?.[1]), stderr: () => err });
     });
     child.on("exit", (code) => {
       clearTimeout(timer);
-      reject(new Error(`exited ${code}: ${out}`));
+      reject(new Error(`exited ${code}: ${out}${err}`));
     });
   });
-}
-
-test("T20 startup log: one line with 'AI: rules only' and 'SMS: simulated (outbox)'", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "callback-boot-"));
-  const env = { PATH: process.env.PATH, HOME: process.env.HOME, DB_PATH: join(dir, "boot.db"), PORT: "4163" };
-  const child = spawn(process.execPath, ["server/index.js"], { cwd: ROOT, env, stdio: ["ignore", "pipe", "pipe"] });
-  try {
-    const out = await waitForLine(child);
-    const line = out.trimEnd();
-    assert.ok(line.includes("AI: rules only"));
-    assert.ok(line.includes("SMS: simulated (outbox)"));
-    assert.match(line, /^Callback on http:\/\/localhost:4163 \| AI: rules only \(set ANTHROPIC_API_KEY for claude-opus-5-5\) \| SMS: simulated \(outbox\) \| Inbound: \/api\/inbound\/\{sms,call,email,form\} \| Passcode: off \| Demo: on, clock Mon [A-Z][a-z]{2} \d{1,2} 7:0\dam$/);
-    const today = await (await fetch("http://127.0.0.1:4163/api/today")).json();
-    assert.equal(today.header, "10 people to call");
-    assert.equal(today.demo.shifted, true);
-  } finally {
+  const stop = async () => {
     child.kill("SIGTERM");
     await new Promise((resolve) => (child.exitCode != null ? resolve() : child.on("exit", resolve)));
+  };
+  return { ready, stop };
+}
+
+function bootOnce(env) {
+  const dir = mkdtempSync(join(tmpdir(), "callback-boot-"));
+  try {
+    return spawnSync(process.execPath, [SERVER], {
+      cwd: dir, env: { PATH: process.env.PATH, PORT: "0", DB_PATH: join(dir, "boot.db"), ...env }, encoding: "utf8", timeout: 10_000,
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("T20 startup log: one line with 'AI: rules only' and 'SMS: simulated (outbox)'; links use the real port", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "callback-boot-"));
+  const server = boot(dir, { DB_PATH: join(dir, "boot.db") });
+  try {
+    const { line, port, stderr } = await server.ready;
+    assert.ok(line.includes("AI: rules only"));
+    assert.ok(line.includes("SMS: simulated (outbox)"));
+    assert.match(line, /^Callback on http:\/\/localhost:\d+ \| AI: rules only \(set ANTHROPIC_API_KEY for claude-sonnet-5-5\) \| SMS: simulated \(outbox\) \| Inbound: \/api\/inbound\/\{sms,call,email,form\} \| Passcode: off \| Demo: on, clock Mon [A-Z][a-z]{2} \d{1,2} 7:0\dam$/);
+    const base = `http://127.0.0.1:${port}`;
+    const today = await (await fetch(`${base}/api/today`)).json();
+    assert.equal(today.header, "10 people to call");
+    assert.equal(today.demo.shifted, true);
+    // regression HM-1: every generated link points at the port the server really listens on.
+    const settings = await (await fetch(`${base}/api/settings`)).json();
+    assert.equal(settings.readonly_url, `http://localhost:${port}/n/${settings.readonly_key}`);
+    assert.equal(settings.webhook_urls.sms, `http://localhost:${port}/api/inbound/sms`);
+    const preview = await (await fetch(`${base}/api/digest/preview`)).json();
+    assert.ok(preview.digest.body.endsWith(`Open: http://localhost:${port}/#/`));
+    const outbox = await (await fetch(`${base}/api/outbox`)).json();
+    assert.ok(outbox.items[0].body.endsWith(`Open: http://localhost:${port}/#/`), "the seeded texts too");
+    assert.equal(stderr(), "", "regression HM-11: no '.env not found' warning");
+  } finally {
+    await server.stop();
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
 test("production without APP_PASSCODE refuses to start", () => {
-  const dir = mkdtempSync(join(tmpdir(), "callback-prod-"));
+  const res = bootOnce({ NODE_ENV: "production" });
+  assert.equal(res.status, 1);
+  assert.match(res.stderr, /APP_PASSCODE/);
+  assert.equal(res.stdout, "");
+});
+
+test("regression security RT-8: signature checks with no public PUBLIC_URL warn, and refuse in production", async () => {
+  const prod = bootOnce({ NODE_ENV: "production", APP_PASSCODE: "4321", TWILIO_AUTH_TOKEN: "authtok" });
+  assert.equal(prod.status, 1);
+  assert.match(prod.stderr, /PUBLIC_URL/);
+  const local = bootOnce({ NODE_ENV: "production", APP_PASSCODE: "4321", MAILGUN_SIGNING_KEY: "key", PUBLIC_URL: "http://localhost:3000" });
+  assert.equal(local.status, 1);
+
+  const dir = mkdtempSync(join(tmpdir(), "callback-boot-"));
+  const server = boot(dir, { DB_PATH: join(dir, "boot.db"), TWILIO_AUTH_TOKEN: "authtok" });
   try {
-    const env = { PATH: process.env.PATH, DB_PATH: join(dir, "prod.db"), PORT: "4164", NODE_ENV: "production" };
-    const res = spawnSync(process.execPath, ["server/index.js"], { cwd: ROOT, env, encoding: "utf8", timeout: 10_000 });
-    assert.equal(res.status, 1);
-    assert.match(res.stderr, /APP_PASSCODE/);
-    assert.equal(res.stdout, "");
+    const { stderr } = await server.ready;
+    await new Promise((resolve) => setTimeout(resolve, 50)); // the warning follows the startup line on stderr
+    assert.match(stderr(), /^Warning: .*PUBLIC_URL/);
   } finally {
+    await server.stop();
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("regression security RT-3: a production boot with DEMO=1 doesn't seed or shift the clock", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "callback-boot-"));
+  const dbPath = join(dir, "prod.db");
+  const server = boot(dir, { DB_PATH: dbPath, NODE_ENV: "production", DEMO: "1", APP_PASSCODE: "4321" });
+  try {
+    const { line } = await server.ready;
+    assert.ok(line.endsWith("| Passcode: on | Demo: off"), line);
+  } finally {
+    await server.stop();
+  }
+  const db = openDb(dbPath);
+  assert.equal(get(db, "SELECT count(*) AS n FROM jobs").n, 0);
+  db.close();
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("regression security RT-3: NODE_ENV=production turns the demo off, whatever DEMO says", async () => {
+  const api = await start({ seed: false, env: { NODE_ENV: "production", DEMO: "1", APP_PASSCODE: "4321" } });
+  assert.equal((await api.get("/api/health")).json.demo, false);
+  const login = await api.post("/api/login", { passcode: "4321" });
+  const cookie = login.headers.get("set-cookie").split(";")[0];
+  assert.deepEqual(errorOf(await api.post("/api/sim/reset", {}, { cookie })), [404, "not_found"]);
+  assert.equal((await api.get("/api/today", { cookie })).json.demo.shifted, false);
 });
 
 test("listing endpoints clamp ?limit and the Today count matches the cards", async () => {

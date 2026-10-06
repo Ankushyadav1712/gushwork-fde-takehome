@@ -15,6 +15,7 @@ export const SETTINGS = Object.freeze({
   company_name: "Frostline Refrigeration",
   owner_name: "Denise",
   owner_phone: "+13125550100",
+  owner_email: null,
   husband_name: "Rick",
   husband_phone: "+13125550108",
   techs: [

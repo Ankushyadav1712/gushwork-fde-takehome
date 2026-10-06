@@ -1,0 +1,15 @@
+# One-click demo deploy on Render (Blueprint). The free plan's disk is temporary, so each restart
+# re-seeds the demo week. For Denise's real data, use NODE_ENV=production, APP_PASSCODE and a disk.
+services:
+  - type: web
+    name: callback-demo
+    runtime: docker
+    plan: free
+    healthCheckPath: /api/health
+    envVars:
+      - key: DEMO
+        value: "1"
+      - key: APP_PASSCODE
+        sync: false
+      - key: PUBLIC_URL
+        sync: false

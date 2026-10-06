@@ -3,12 +3,14 @@
 import { randomBytes } from "node:crypto";
 import { get, all, run, tx } from "./db.js";
 import { normalizePhone } from "../shared/format.js";
+import { normalizeEmail } from "../shared/parse.js";
+import { DEFAULT_TZ } from "../shared/time.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const CLOSED_STAGES = ["done", "lost"];
 
 /** Event kinds that only record that something happened; they never change job state (§5.6). */
-export const NON_STATE_EVENT_KINDS = ["notified", "call_tap", "text_tap", "tech_text", "ai_refined"];
+const NON_STATE_EVENT_KINDS = ["notified", "call_tap", "text_tap", "tech_text", "ai_refined"];
 
 const CUSTOMER_COLUMNS = [
   "id", "contact_name", "business_name", "phone", "email", "address", "notes", "blocked",
@@ -17,7 +19,7 @@ const CUSTOMER_COLUMNS = [
 const CUSTOMER_FIELDS = ["contact_name", "business_name", "phone", "email", "address", "notes"];
 const CUSTOMER_EDITABLE = [...CUSTOMER_FIELDS, "blocked"];
 
-export const JOB_COLUMNS = [
+const JOB_COLUMNS = [
   "id", "customer_id", "stage", "source", "source_detail", "problem", "details", "equipment",
   "urgent", "urgent_source", "ai_not_service", "parsed_by", "quote_amount", "quote_sent_at",
   "visit_date", "tech", "notes", "created_at", "updated_at", "stage_entered_at",
@@ -96,11 +98,6 @@ function squash(text) {
   return String(text ?? "").toLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
 }
 
-function cleanEmail(email) {
-  const trimmed = email == null ? "" : String(email).trim().toLowerCase();
-  return trimmed || null;
-}
-
 function isBlank(value) {
   return value == null || (typeof value === "string" && value.trim() === "");
 }
@@ -112,6 +109,7 @@ export const SETTINGS_DEFAULTS = Object.freeze({
   company_name: "Frostline Refrigeration",
   owner_name: "Denise",
   owner_phone: "+13125550100",
+  owner_email: null, // her own address, so emails she forwards aren't taken for the customer's
   husband_name: "Rick",
   husband_phone: "+13125550108",
   techs: Object.freeze([
@@ -120,7 +118,7 @@ export const SETTINGS_DEFAULTS = Object.freeze({
     Object.freeze({ name: "Dee", phone: "+13125550123" }),
     Object.freeze({ name: "Sam", phone: "+13125550124" }),
   ]),
-  timezone: "America/Chicago",
+  timezone: DEFAULT_TZ,
   digest_time: "07:00",
   friday_sweep: true,
   weekend_digest: true,
@@ -190,7 +188,7 @@ export function findCustomerByPhone(db, phone) {
 
 /** Exact, lowercased email match (oldest customer first if several share it). */
 export function findCustomerByEmail(db, email) {
-  const clean = cleanEmail(email);
+  const clean = normalizeEmail(email);
   return clean ? get(db, "SELECT * FROM customers WHERE email = ? ORDER BY id LIMIT 1", [clean]) : null;
 }
 
@@ -211,21 +209,19 @@ export function findCustomerByBusinessInText(db, text) {
 
 /**
  * §7.3 match order: phone, then email, then (forwarded texts only) business name in the text.
+ * A phone that matches nobody marks a different person, so email is then not tried (C4).
  * Returns the customer row (blocked customers included; the caller decides) or null.
  */
 export function matchCustomer(db, { phone = null, email = null, text = null, forwarded = false } = {}) {
-  return (
-    findCustomerByPhone(db, phone) ??
-    findCustomerByEmail(db, email) ??
-    (forwarded ? findCustomerByBusinessInText(db, text) : null)
-  );
+  const byPhoneOrEmail = normalizePhone(phone) ? findCustomerByPhone(db, phone) : findCustomerByEmail(db, email);
+  return byPhoneOrEmail ?? (forwarded ? findCustomerByBusinessInText(db, text) : null);
 }
 
-/** Customer fields normalised for storage: E.164 phone, lowercased email. */
+/** Customer fields normalised for storage: E.164 phone, one plain lowercased email (else null). */
 function cleanCustomerFields(fields) {
   const clean = { ...fields };
   if ("phone" in clean) clean.phone = normalizePhone(clean.phone);
-  if ("email" in clean) clean.email = cleanEmail(clean.email);
+  if ("email" in clean) clean.email = normalizeEmail(clean.email);
   return clean;
 }
 
@@ -272,10 +268,6 @@ export function updateCustomer(db, id, patch, now) {
   return getCustomer(db, id);
 }
 
-export function setBlocked(db, id, blocked, now) {
-  return updateCustomer(db, id, { blocked: blocked ? 1 : 0 }, now);
-}
-
 // ---------------------------------------------------------------------------
 // Jobs
 
@@ -292,6 +284,14 @@ export function getJobRow(db, id) {
 export function updateJob(db, id, patch) {
   updateRow(db, "jobs", JOB_COLUMNS, id, patch);
   return getJobRow(db, id);
+}
+
+/** Delete a job and its history. Only for a job no message or text points at (a just-spawned one). */
+export function deleteJob(db, id) {
+  tx(db, () => {
+    run(db, "DELETE FROM events WHERE job_id = ?", [id]);
+    run(db, "DELETE FROM jobs WHERE id = ?", [id]);
+  });
 }
 
 const JOB_VIEW_SELECT = `
@@ -407,7 +407,7 @@ function messageRowForWrite(row) {
 }
 
 /** Adds parsed `raw` and `parse` next to the stored raw_json / parse_json text. */
-export function parseMessageRow(row) {
+function parseMessageRow(row) {
   if (!row) return null;
   const raw = parseJsonText(row.raw_json);
   return { ...row, raw: raw ?? row.raw_json, parse: parseJsonText(row.parse_json) };
@@ -442,12 +442,6 @@ export function listMessages(db, limit = 50) {
     .map(parseMessageRow);
 }
 
-/** A job's messages in the order they arrived. */
-export function messagesForJob(db, jobId) {
-  return all(db, "SELECT * FROM messages WHERE job_id = ? ORDER BY received_at, id", [jobId])
-    .map(parseMessageRow);
-}
-
 /** Messages never linked to a job (§7.5). Must always be 0. */
 export function unlinkedMessageCount(db) {
   return get(
@@ -460,7 +454,7 @@ export function unlinkedMessageCount(db) {
 // Events (timeline and undo)
 
 /** Adds parsed `data` and `prev` next to the stored data_json / prev_json text. */
-export function parseEventRow(row) {
+function parseEventRow(row) {
   if (!row) return null;
   return { ...row, data: parseJsonText(row.data_json), prev: parseJsonText(row.prev_json) };
 }
@@ -483,12 +477,6 @@ export function getEvent(db, id) {
   return parseEventRow(get(db, "SELECT * FROM events WHERE id = ?", [id]));
 }
 
-/** A job's events, newest first. */
-export function listEvents(db, jobId) {
-  return all(db, "SELECT * FROM events WHERE job_id = ? ORDER BY at DESC, id DESC", [jobId])
-    .map(parseEventRow);
-}
-
 /** The job's most recently written event that changes state (undone ones included), or null. */
 export function latestStateEvent(db, jobId) {
   const skip = NON_STATE_EVENT_KINDS.map((kind) => `'${kind}'`).join(", ");
@@ -499,11 +487,6 @@ export function latestStateEvent(db, jobId) {
 
 export function markUndone(db, id) {
   return run(db, "UPDATE events SET undone = 1 WHERE id = ?", [id]).changes;
-}
-
-/** When a text to Denise last named this job, or null. */
-export function lastNotifiedAt(db, jobId) {
-  return get(db, "SELECT max(at) AS at FROM events WHERE job_id = ? AND kind = 'notified'", [jobId]).at;
 }
 
 // ---------------------------------------------------------------------------
@@ -535,13 +518,11 @@ export function listOutbox(db, limit = 50) {
   return all(db, "SELECT * FROM outbox ORDER BY created_at DESC, id DESC LIMIT ?", [limit]);
 }
 
-export function outboxByDedupe(db, key) {
-  return key == null ? null : get(db, "SELECT * FROM outbox WHERE dedupe_key = ?", [key]);
-}
-
-/** Delete one outbox row (used to retry a text that failed to send). */
-export function deleteOutbox(db, id) {
-  return run(db, "DELETE FROM outbox WHERE id = ?", [id]).changes;
+/** How many texts of `kind` were queued after `sinceIso`, to one number when `toPhone` is given. */
+export function countOutboxSince(db, kind, sinceIso, toPhone = null) {
+  const byPhone = toPhone == null ? "" : " AND to_phone = ?";
+  const params = toPhone == null ? [kind, sinceIso] : [kind, sinceIso, toPhone];
+  return get(db, `SELECT count(*) AS n FROM outbox WHERE kind = ? AND created_at > ?${byPhone}`, params).n;
 }
 
 /** Delete outbox rows created after `iso` (the demo clock moved backwards). Returns the count. */

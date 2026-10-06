@@ -5,9 +5,6 @@ import { equipmentLabel } from "./stages.js";
 import { firstName, money, phoneDisplay, titleFor } from "./format.js";
 import { dayLabel, localDate } from "./time.js";
 
-const DEFAULT_OWNER = "Denise";
-const DEFAULT_COMPANY = "Frostline Refrigeration";
-
 /** `sms:` link that opens her messaging app with the body filled in. */
 export function smsLink(phone, body) {
   if (!phone) return null;
@@ -41,15 +38,12 @@ function draftKind(jv, bucket, ctx) {
 }
 
 function isUpcoming(visitDate, ctx) {
-  if (!visitDate || !ctx?.now) return true;
-  return visitDate >= localDate(ctx.now, ctx.tz);
+  return !visitDate || visitDate >= localDate(ctx.now, ctx.tz);
 }
 
 /** Drafted follow-up text for the card's Text button. `bucket` may be null (Job detail). */
 export function smsDraft(jv, bucket, ctx) {
-  const settings = ctx?.settings ?? {};
-  const owner = settings.owner_name || DEFAULT_OWNER;
-  const company = settings.company_name || DEFAULT_COMPANY;
+  const { owner_name: owner, company_name: company } = ctx.settings;
   const first = firstName(jv.customer?.contact_name);
   const hi = first ? `Hi ${first},` : "Hi,";
   const intro = `${hi} it's ${owner} at ${company}`;
@@ -74,7 +68,7 @@ export function smsDraft(jv, bucket, ctx) {
     case "check_done":
       return `${intro}. Just making sure everything's working right with the ${thing} after ${tech ? `${tech}'s` : "our"} visit.`;
     case "scheduled": {
-      const day = ctx?.now ? dayLabel(jv.visit_date, ctx.now, ctx.tz) : jv.visit_date;
+      const day = dayLabel(jv.visit_date, ctx.now, ctx.tz);
       return `${intro}. Confirming ${tech || "our tech"} for ${day} for the ${thing}.`;
     }
     default:
@@ -82,16 +76,16 @@ export function smsDraft(jv, bucket, ctx) {
   }
 }
 
-/** "Text a tech" body: business, address, problem, contact, signed by the owner. */
+/** "Text a tech" body: business, address, problem, contact, signed by the owner (once settings are loaded). */
 export function techText(jv, ctx) {
   const c = jv.customer ?? {};
-  const owner = ctx?.settings?.owner_name || DEFAULT_OWNER;
+  const owner = ctx.settings?.owner_name;
   const business = c.business_name || titleFor(jv);
   const contact = [c.contact_name, phoneDisplay(c.phone)].filter(Boolean).join(" ") || "unknown";
   return [
     `${business} - ${c.address || "no address"}`,
     jv.problem || "no details",
     `Contact: ${contact}`,
-    `- ${owner}`,
-  ].join("\n");
+    owner && `- ${owner}`,
+  ].filter(Boolean).join("\n");
 }

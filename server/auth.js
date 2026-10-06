@@ -1,11 +1,13 @@
 // Optional single passcode (SPEC §13.5, D20). When APP_PASSCODE is set, every /api/* route needs the
 // cb_session cookie except login, health and the inbound webhooks. The cookie is an HMAC made with
-// SESSION_SECRET (random per boot when unset), httpOnly, SameSite=Lax, valid for 180 days.
+// SESSION_SECRET, or with a secret generated once and kept in the database, so a restart or deploy
+// doesn't log anyone out. httpOnly, SameSite=Lax, valid for 180 days.
 // Cookie ages use real time on purpose: moving the demo clock must not log anyone out.
-import { createHmac, randomBytes } from "node:crypto";
+import { createHmac } from "node:crypto";
 import { safeEqual } from "./adapters.js";
+import { getOrCreateSecret } from "./repo.js";
 
-export const COOKIE_NAME = "cb_session";
+const COOKIE_NAME = "cb_session";
 const MAX_AGE_S = 180 * 24 * 60 * 60;
 const EXEMPT_PATHS = ["/api/login", "/api/health"];
 const EXEMPT_PREFIXES = ["/api/inbound/"];
@@ -17,7 +19,7 @@ function sendUnauthorized(res, message, status = 401) {
 }
 
 /** The value of one cookie from the Cookie header, or null. */
-export function readCookie(req, name) {
+function readCookie(req, name) {
   for (const part of String(req.headers.cookie ?? "").split(";")) {
     const eq = part.indexOf("=");
     if (eq !== -1 && part.slice(0, eq).trim() === name) return decodeURIComponent(part.slice(eq + 1).trim());
@@ -49,13 +51,13 @@ function failureTracker() {
 }
 
 /**
- * createAuth({env}) -> {enabled, guard, login, issue, verify}.
+ * createAuth({env, db, publicUrl}) -> {guard, login}.
  * `guard` is middleware for /api; `login` handles POST /api/login {passcode}.
  */
-export function createAuth({ env = process.env } = {}) {
+export function createAuth({ env, db, publicUrl }) {
   const passcode = env.APP_PASSCODE || "";
-  const secret = env.SESSION_SECRET || randomBytes(32).toString("hex");
-  const secureCookie = /^https:/i.test(env.PUBLIC_URL ?? "");
+  const secret = passcode ? env.SESSION_SECRET || getOrCreateSecret(db, "session") : null;
+  const secureCookie = /^https:/i.test(publicUrl);
   const tracker = failureTracker();
 
   // The passcode is part of the signed text, so changing APP_PASSCODE signs everyone out.
@@ -101,5 +103,5 @@ export function createAuth({ env = process.env } = {}) {
     res.json({ ok: true });
   }
 
-  return { enabled: Boolean(passcode), guard, login, issue, verify };
+  return { guard, login };
 }

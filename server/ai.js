@@ -5,10 +5,11 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { z } from "zod";
 import { betaZodOutputFormat } from "@anthropic-ai/sdk/helpers/beta/zod";
+import { EQUIPMENT } from "../shared/stages.js";
 
-export const AI_MODEL = process.env.ANTHROPIC_MODEL || "claude-opus-5-5";
+export const AI_MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-5-5";
 
-const EQUIPMENT = ["walk_in_cooler", "walk_in_freezer", "ice_machine", "reach_in", "display_case", "prep_table", "other"];
+const EQUIPMENT_IDS = EQUIPMENT.map((e) => e.id);
 const URGENCY = ["emergency", "normal", "routine"];
 
 // Enum-like fields are plain strings here and normalized below, so one odd value from the
@@ -19,7 +20,7 @@ const Extraction = z.object({
   phone: z.string().nullable().describe("Callback phone number exactly as written. Null if none is written."),
   email: z.string().nullable().describe("Email address if written. Null otherwise."),
   address: z.string().nullable().describe("Service address if stated. Null otherwise."),
-  equipment: z.string().describe(`One of: ${EQUIPMENT.join(", ")}.`),
+  equipment: z.string().describe(`One of: ${EQUIPMENT_IDS.join(", ")}.`),
   summary: z.string().describe("What is wrong or wanted, max 8 words, plain English. e.g. 'Walk-in freezer not holding temp'."),
   details: z.string().nullable().describe("Other useful specifics in one or two short sentences (symptoms, timing, access notes). Null if nothing more."),
   urgency: z.string().describe(`One of: ${URGENCY.join(", ")}.`),
@@ -99,7 +100,7 @@ function normalize(x) {
     phone: clean(x.phone),
     email: clean(x.email),
     address: clean(x.address),
-    equipment: EQUIPMENT.includes(equipment) ? equipment : "other",
+    equipment: EQUIPMENT_IDS.includes(equipment) ? equipment : "other",
     summary: clean(x.summary) || "Service request",
     details: clean(x.details),
     urgency: URGENCY.includes(urgency) ? urgency : "normal",

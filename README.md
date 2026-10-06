@@ -24,7 +24,7 @@ Then open <http://localhost:3000>. It's built for a phone, so narrow the browser
 - **Requirements:** Node 22.13+. It uses Node's built-in SQLite, so there is no database to install. It needs no API keys and no paid services.
 - **First boot:** it seeds a realistic demo week and sets a **demo clock** to the most recent Monday 7:00am, the morning after the Friday freezer call.
 - **Reset:** **Demo controls → Reset demo** (or `npm run seed`) restores that starting point.
-- **Optional AI:** set `ANTHROPIC_API_KEY` to have Claude read messy texts and emails. Without a key, a rule-based parser does the reading.
+- **Optional AI:** set `ANTHROPIC_API_KEY` to have Claude Sonnet (`claude-sonnet-5-5`) read messy texts and emails. At 20–40 messages a week that's well under $1 a month. Without a key, a free rule-based parser does the reading, and that's what the demo uses.
 
 ## What's in it
 
@@ -61,10 +61,12 @@ server/      Node + Express 5 + built-in SQLite
   seed.js        demo seed: replays the Friday-to-Monday weekend through the real code paths
 public/      Preact + htm, no build step; phone-first, light/dark
 test/        node:test, unit + integration (in-memory SQLite, real HTTP)
+scripts/     e2e.mjs: the demo script, walked in headless Chrome
 ```
 
 ```bash
 npm test        # the whole suite runs in a few seconds
+npm run e2e     # walks docs/DEMO.md in headless Chrome on its own server (set CHROME_PATH if Chrome isn't in /Applications)
 ```
 
 ## Going live
@@ -74,20 +76,43 @@ The prototype runs every channel through the same `ingest()` the demo simulator 
 | Channel | Point it at | What changes for Denise |
 |---|---|---|
 | Website form (if the form builder has webhooks) | `POST {PUBLIC_URL}/api/inbound/form` | Nothing |
-| Website-form emails (Gmail filter → Postmark/Mailgun inbound) | `/webhooks/postmark` or `/webhooks/mailgun` | Nothing. Her inbox stays the same, and duplicates are dropped by Message-ID. |
-| Customer texts (Twilio number) | `/webhooks/twilio/sms` | Forwards texts to a "New Job" contact. Later, customers text it directly. |
-| Missed calls / voicemail (carrier "forward when unanswered" → Twilio) | `/webhooks/twilio/voice` | Nothing. One carrier setting, which she can undo. |
+| Website-form emails (Gmail filter → Postmark/Mailgun inbound) | `/api/inbound/email` | Nothing. Her inbox stays the same, and duplicates are dropped by Message-ID. The form mailer's address is never taken for the customer; the customer is read from the form. |
+| Customer texts (Twilio number) | `/api/inbound/sms` | Forwards texts to a "New Job" contact. Later, customers text it directly. |
+| Missed calls / voicemail (carrier "forward when unanswered" → Twilio) | `/api/inbound/call` | Nothing. One carrier setting, which she can undo. |
 | Texts to Denise | set `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM` | Nothing |
 
-Configuration lives in [`.env.example`](.env.example). For a real deployment, set:
+There is one address per channel, and **Settings → For whoever sets this up** lists all four (with `?token=` when `INBOUND_TOKEN` is set).
+
+Configuration lives in [`.env.example`](.env.example). Copy it to `.env`, which is read at start when it exists. For a real deployment, set:
 
 | Variable | Purpose |
 |---|---|
-| `NODE_ENV=production` | Turns off the demo. |
+| `NODE_ENV=production` | Turns off the demo (seed data, demo clock, Demo controls), whatever `DEMO` says. |
 | `APP_PASSCODE` | Required in production. |
-| `PUBLIC_URL` | Used for links in texts and for Twilio signature checks. |
+| `SESSION_SECRET` | Optional. Signs the login cookie. When blank, one is generated once and kept in the database, so restarts don't log Denise out. |
+| `PUBLIC_URL` | The public https address. Used for links in texts and for signature checks. With signature checks on, production won't start without it. |
 | `INBOUND_TOKEN` | Webhooks then need `?token=`. |
-| `TWILIO_AUTH_TOKEN` / `MAILGUN_SIGNING_KEY` | Turn on signature checks. |
+| `TWILIO_AUTH_TOKEN` / `MAILGUN_SIGNING_KEY` | Turn on signature checks: every request to the text and call webhooks needs a valid Twilio signature, and every request to the email webhook a fresh Mailgun one. |
 | `BUSINESS_TZ` | The business time zone. Default `America/Chicago`. |
 
 SQLite lives at `DB_PATH`. Back it up nightly. One small VM with HTTPS in front is enough for 20 jobs a week.
+
+## Deploy a demo
+
+The app is one long-running Node process with a SQLite file, so it needs a host that runs a container or a server. Serverless hosts like Vercel don't fit: they have no lasting disk for the database and no always-on process for the 7am text and reminders.
+
+**Render (free, uses [`render.yaml`](render.yaml))**
+1. In Render, choose **New → Blueprint** and pick this repo. It builds the [`Dockerfile`](Dockerfile) with `DEMO=1`.
+2. Set `PUBLIC_URL` to the Render address, and optionally `APP_PASSCODE`.
+3. Leave `ANTHROPIC_API_KEY` unset on a public demo, or anyone with the link can spend your credits.
+
+The free plan sleeps after 15 idle minutes, so the first visit takes up to a minute. Its disk is temporary, so every restart re-seeds the demo week.
+
+**Any Docker host**
+
+```bash
+docker build -t callback .
+docker run -p 3000:3000 -e DEMO=1 -v callback-data:/data callback
+```
+
+For Denise's real data, set `NODE_ENV=production`, `APP_PASSCODE` and `PUBLIC_URL`, and keep `/data` on a persistent volume.

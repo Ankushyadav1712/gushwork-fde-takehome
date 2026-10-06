@@ -9,7 +9,11 @@ function trapTab(event, panel) {
   if (!items.length) return;
   const first = items[0];
   const last = items[items.length - 1];
-  if (event.shiftKey && document.activeElement === first) {
+  // Focus can drop to <body> when the step it was on is replaced; pull it back into the sheet.
+  if (!panel.contains(document.activeElement) || document.activeElement === panel) {
+    event.preventDefault();
+    (event.shiftKey ? last : first).focus();
+  } else if (event.shiftKey && document.activeElement === first) {
     event.preventDefault();
     last.focus();
   } else if (!event.shiftKey && document.activeElement === last) {
@@ -18,10 +22,22 @@ function trapTab(event, panel) {
   }
 }
 
-export function Sheet({ titleId, onClose, children, className = "" }) {
+/**
+ * `step` names the sheet's current step. When it changes, focus moves to that step's title
+ * (an element with class "step-title" and tabindex="-1"), so the new question is announced.
+ */
+export function Sheet({ titleId, onClose, step = null, children, className = "" }) {
   const panel = useRef(null);
   const closeRef = useRef(onClose);
   closeRef.current = onClose;
+  const firstStep = useRef(step);
+
+  useEffect(() => {
+    if (step === firstStep.current) return;
+    firstStep.current = undefined;
+    const el = panel.current;
+    (el?.querySelector(".step-title[tabindex]") || el)?.focus({ preventScroll: true });
+  }, [step]);
 
   useEffect(() => {
     const opener = document.activeElement;

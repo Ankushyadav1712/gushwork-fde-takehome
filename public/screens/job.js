@@ -1,23 +1,30 @@
 // Job detail (#/job/:id): fields saved on blur, stage stepper, history, past jobs,
 // and Call · Text · Text a tech · Lost / Bring back (§5.7, §9).
-import { html, useState, useEffect } from "/vendor/preact-htm.js";
+import { html, useState, useEffect, useRef } from "/vendor/preact-htm.js";
 import * as api from "../api.js";
-import { phoneDisplay } from "/shared/format.js";
+import { phoneDisplay, plural } from "/shared/format.js";
 import { whenLabel } from "/shared/time.js";
 import { techText } from "/shared/templates.js";
-import { useApp, useAsync, ErrorState, Loading, PageHeader, capitalize, smsHref } from "../ui/common.js";
-import { STAGES, EQUIPMENT, isOpenStage, stageLabel, equipmentChip, ERROR_COPY } from "../ui/constants.js";
+import { STAGES, EQUIPMENT, isOpen, stageLabel } from "/shared/stages.js";
+import { useApp, useAsync, ErrorState, Loading, PageHeader, capitalize, smsHref, mailtoHref } from "../ui/common.js";
+import { equipmentChip, ERROR_COPY } from "../ui/constants.js";
 import { stageInfo, JobRow } from "../ui/job-info.js";
 import { Sheet } from "../ui/sheet.js";
 import { DayPicker, TechPicker, AmountPad, LostReasonPicker } from "../ui/pickers.js";
 import { Icon } from "../ui/icons.js";
+import { ReplyQuote } from "./outcome-sheet.js";
 
 const MAPS_URL = "https://maps.google.com/?q=";
+
+/** The customer's latest message on this job, from the history. */
+function latestInbound(timeline = []) {
+  return timeline.filter((t) => t.actor === "customer" && t.body).sort(newestFirst)[0] || null;
+}
 
 /** The outcome-sheet subject for this job, shaped like a Today card. */
 function subjectFrom(detail) {
   const { job, customer, timeline = [], outcomes = [] } = detail;
-  const inbound = timeline.filter((t) => t.actor === "customer" && t.body).sort(newestFirst)[0];
+  const inbound = latestInbound(timeline);
   return {
     job_id: job.id, title: job.title, stage: job.stage, bucket: job.bucket, outcomes,
     unread: Boolean(job.unread_inbound_at),
@@ -80,7 +87,7 @@ function UrgentSwitch({ on, onToggle }) {
 }
 
 function NextDateLine({ job, now, tz, onChange }) {
-  if (!isOpenStage(job.stage)) {
+  if (!isOpen(job.stage)) {
     return html`<p class="next-line">${capitalize(stageInfo(job, now, tz))}</p>`;
   }
   if (job.on_today) {
@@ -94,7 +101,7 @@ function NextDateLine({ job, now, tz, onChange }) {
 }
 
 function StageStepper({ stage, onPick }) {
-  return html`<ol class="stage-stepper" aria-label="Stage">
+  return html`<ol class="stage-stepper" aria-labelledby="stage-h">
     ${STAGES.map((s) => html`<li key=${s.id}>
       <button type="button" class=${`stage-step ${s.id === stage ? "active" : ""} stage-${s.id}`}
         aria-current=${s.id === stage ? "step" : null} onClick=${() => s.id !== stage && onPick(s.id)}>
@@ -121,15 +128,19 @@ function StageSheet({ job, to, onClose }) {
   const [step, setStep] = useState(to === "scheduled" ? "day" : null);
   const [visitDate, setVisitDate] = useState(null);
   const [error, setError] = useState(null);
+  const inFlight = useRef(false);
   const techs = app.settings?.techs || [];
 
   async function submit(args = {}) {
+    if (inFlight.current) return;
+    inFlight.current = true;
     setError(null);
     try {
       const result = await api.postStage(job.id, { to, ...args });
       onClose();
-      app.outcomeSaved(job.id, result);
+      app.outcomeSaved(job.id, result, { tech: args.tech });
     } catch (err) {
+      inFlight.current = false;
       if (err.status === 409) { onClose(); app.staleStage(); return; }
       if (err.status !== 401) setError(err.status === 0 ? ERROR_COPY : "That didn't save. Please try again.");
     }
@@ -142,9 +153,9 @@ function StageSheet({ job, to, onClose }) {
 
   let body;
   if (to === "scheduled" && step === "day") {
-    body = html`<p class="step-title">Which day?</p><${DayPicker} now=${app.nowIso()} tz=${app.tz} onPick=${pickDay} />`;
+    body = html`<p class="step-title" tabindex="-1">Which day?</p><${DayPicker} now=${app.nowIso()} tz=${app.tz} onPick=${pickDay} />`;
   } else if (to === "scheduled") {
-    body = html`<p class="step-title">Which tech?</p>
+    body = html`<p class="step-title" tabindex="-1">Which tech?</p>
       <${TechPicker} techs=${techs} onPick=${(tech) => submit({ visit_date: visitDate, tech })} />`;
   } else if (to === "waiting_yes") {
     body = html`<p class="step-title">Quote amount (optional)</p>
@@ -157,8 +168,8 @@ function StageSheet({ job, to, onClose }) {
       <button type="button" class="btn btn-secondary" onClick=${onClose}>Cancel</button>
     </div>`;
   }
-  return html`<${Sheet} titleId="stage-title" onClose=${onClose}>
-    <h2 id="stage-title" class="sheet-title">${to === "new" && !isOpenStage(job.stage) ? "Bring this job back?" : `Move to ${stageLabel(to)}?`}</h2>
+  return html`<${Sheet} titleId="stage-title" step=${step} onClose=${onClose}>
+    <h2 id="stage-title" class="sheet-title">${to === "new" && !isOpen(job.stage) ? "Bring this job back?" : `Move to ${stageLabel(to)}?`}</h2>
     ${error && html`<p class="inline-error" role="alert">${error}</p>`}
     ${body}
   </${Sheet}>`;
@@ -182,13 +193,15 @@ function TechTextSheet({ job, customer, onClose }) {
 }
 
 function ActionBar({ detail, open, onTap, onTechText, onLost, onBringBack }) {
+  // The sheet's lost outcome is "Cancelled" for a booked visit (§5.2); the bar uses the same word.
+  const lostLabel = detail.job.stage === "scheduled" ? "Cancelled" : "Lost";
   return html`<div class="action-bar">
     <div class="action-bar-inner">
       ${detail.tel_link && html`<a class="action btn-call" href=${detail.tel_link} onClick=${() => onTap("call")}><${Icon} name="phone" size=${20} /><span>Call</span></a>`}
       ${detail.sms_link && html`<a class="action btn-text" href=${detail.sms_link} onClick=${() => onTap("text")}><${Icon} name="message" size=${20} /><span>Text</span></a>`}
       <button type="button" class="action btn-plain" onClick=${onTechText}><${Icon} name="truck" size=${20} /><span>Text a tech</span></button>
       ${open
-        ? html`<button type="button" class="action btn-plain danger" onClick=${onLost}><${Icon} name="close" size=${20} /><span>Lost</span></button>`
+        ? html`<button type="button" class="action btn-plain danger" onClick=${onLost}><${Icon} name="close" size=${20} /><span>${lostLabel}</span></button>`
         : html`<button type="button" class="action btn-plain" onClick=${onBringBack}><${Icon} name="undo" size=${20} /><span>Bring back</span></button>`}
     </div>
   </div>`;
@@ -203,7 +216,7 @@ export function JobScreen({ id }) {
   useEffect(() => { if (app.version) reload({ quiet: true }); }, [app.version]);
 
   if (!data) {
-    return html`<div class="job-detail"><${PageHeader} title="Job" back="#/jobs" />
+    return html`<div class="job-detail"><${PageHeader} title="Job" back="#/jobs" heading=${false} />
       ${error?.status === 404
         ? html`<p class="empty-note">That job isn't here anymore. <a href="#/jobs">See all jobs</a></p>`
         : error ? html`<${ErrorState} error=${error} onRetry=${reload} />` : html`<${Loading} />`}</div>`;
@@ -211,8 +224,9 @@ export function JobScreen({ id }) {
 
   const { job, customer = {}, timeline, past_jobs: pastJobs = [] } = data;
   const now = app.nowIso();
-  const open = isOpenStage(job.stage);
+  const open = isOpen(job.stage);
   const subject = subjectFrom(data);
+  const inbound = latestInbound(timeline);
   const techs = app.settings?.techs || [];
 
   async function save(name, raw) {
@@ -237,7 +251,7 @@ export function JobScreen({ id }) {
   const chip = equipmentChip(job.equipment);
 
   return html`<div class="job-detail has-action-bar">
-    <${PageHeader} title="Job" back="#/jobs" />
+    <${PageHeader} title="Job" back="#/jobs" heading=${false} />
     <section class="panel job-summary">
       <div class="job-title-row">
         <h1 class="job-title">${job.title}</h1>
@@ -245,11 +259,12 @@ export function JobScreen({ id }) {
       </div>
       ${job.subtitle && html`<p class="job-subtitle">${job.subtitle}</p>`}
       <p class="job-meta">
-        ${[job.source_label, chip, job.repeat?.past_jobs ? `Repeat - ${job.repeat.past_jobs} past ${job.repeat.past_jobs === 1 ? "job" : "jobs"}` : null]
+        ${[job.source_label, chip, job.repeat?.past_jobs ? `Repeat - ${plural(job.repeat.past_jobs, "past job", "past jobs")}` : null]
           .filter(Boolean).join(" · ")}
         ${Boolean(job.urgent) && open && html` <span class="badge badge-urgent">URGENT</span>`}
       </p>
       ${job.on_today && job.reason && html`<p class="job-reason">${job.reason}</p>`}
+      <${ReplyQuote} inbound=${inbound} />
       <${NextDateLine} job=${job} now=${now} tz=${app.tz} onChange=${() => app.openSheet(subject, { initialOutcome: "snooze" })} />
       ${open && subject.outcomes.length > 0 && html`<button type="button" class="btn btn-primary"
         onClick=${() => app.openSheet(subject)}>${job.bucket === "check_done" ? "Did it get done?" : "How'd it go?"}</button>`}
@@ -268,7 +283,7 @@ export function JobScreen({ id }) {
       <${SelectField} label="Tech" name="tech" value=${job.tech} options=${techOptions} onSave=${save} />
       <${Field} label="Notes" name="notes" value=${job.notes} multiline onSave=${save} />
       ${job.details && html`<p class="muted small">${job.details}</p>`}
-      ${job.parsed_by && html`<p class="muted small">Read by ${job.parsed_by === "ai" ? "AI" : job.parsed_by === "rules" ? "rules (no AI)" : "you"}</p>`}
+      ${job.parsed_by === "ai" && html`<p class="muted small">Details filled in by AI</p>`}
     </section>
 
     <section class="panel" aria-labelledby="cust-h">
@@ -278,14 +293,14 @@ export function JobScreen({ id }) {
       <${Field} label="Phone" name="phone" type="tel" value=${phoneDisplay(customer.phone) || ""} onSave=${save}
         action=${data.tel_link && html`<a class="icon-btn outline" href=${data.tel_link} onClick=${() => tap("call")} aria-label="Call"><${Icon} name="phone" /></a>`} />
       <${Field} label="Email" name="email" type="email" value=${customer.email} onSave=${save}
-        action=${customer.email && html`<a class="icon-btn outline" href=${`mailto:${customer.email}`} aria-label="Email"><${Icon} name="mail" /></a>`} />
+        action=${customer.email && html`<a class="icon-btn outline" href=${mailtoHref(customer.email)} aria-label="Email"><${Icon} name="mail" /></a>`} />
       <${Field} label="Address" name="address" value=${customer.address} onSave=${save}
         action=${customer.address && html`<a class="icon-btn outline" href=${MAPS_URL + encodeURIComponent(customer.address)}
           target="_blank" rel="noopener" aria-label="Open in maps"><${Icon} name="map" /></a>`} />
     </section>
 
     <section class="panel" aria-labelledby="stage-h">
-      <h2 id="stage-h" class="panel-title">Stage</h2>
+      <h2 id="stage-h" class="panel-title">Where it's at</h2>
       <${StageStepper} stage=${job.stage} onPick=${setStageTo} />
     </section>
 

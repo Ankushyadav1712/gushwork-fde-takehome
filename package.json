@@ -8,10 +8,11 @@
     "node": ">=22.13"
   },
   "scripts": {
-    "start": "node --env-file-if-exists=.env server/index.js",
-    "dev": "node --watch --env-file-if-exists=.env server/index.js",
-    "seed": "node --env-file-if-exists=.env server/seed.js --reset",
-    "test": "node --test \"test/*.test.js\""
+    "start": "node server/index.js",
+    "dev": "node --watch server/index.js",
+    "seed": "node server/seed.js --reset",
+    "test": "node --test \"test/*.test.js\"",
+    "e2e": "node scripts/e2e.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.131.0",

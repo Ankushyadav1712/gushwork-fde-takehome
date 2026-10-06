@@ -3,15 +3,19 @@
 // ticks every 5 minutes from Friday 12:00 to the anchor A (the most recent Monday 07:00).
 // The weekend's texts and job 16's history therefore come out of the same code the app runs.
 // CLI: node server/seed.js --reset   (wipe the database and reseed)
+import "./env.js";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { openDb, get, wipe } from "./db.js";
 import { ensureSettings, getSettings, putSettings } from "./repo.js";
 import { ingest } from "./ingest.js";
-import { performOutcome } from "./routes/api.js";
+import { performOutcome } from "./actions.js";
+import { contextFor, resolvePublicUrl, DEFAULT_PORT } from "./context.js";
 import { tick } from "./scheduler.js";
 import * as clock from "./clock.js";
-import { addDays, addMinutes, atLocal, localDate, mostRecentMonday0700, shortDateLabel, timeLabel } from "../shared/time.js";
+import {
+  DEFAULT_TZ, addDays, addMinutes, atLocal, localDate, mostRecentMonday0700, shortDateLabel, timeLabel,
+} from "../shared/time.js";
 
 const TICK_MINUTES = 5;
 /** The scheduler replay starts on the Friday before the anchor, at noon (§12.1). */
@@ -288,32 +292,27 @@ function runStep(db, step, state) {
     ingest(db, inboundEvent(record, TEXT, step.args.body, step.at, step.seq), { now: step.at, ai: false, settings });
     return;
   }
-  performOutcome(db, jobIds.get(record.id), { outcome: step.outcome, ...outcomeArgs(step.args, state.place) }, {
-    now: step.at, settings, env: state.env,
-  });
-}
-
-/** The anchor A: the most recent Monday 07:00 local at or before the real time (§12.1). */
-export function defaultAnchor(tz) {
-  return mostRecentMonday0700(new Date().toISOString(), tz);
+  const body = { outcome: step.outcome, ...outcomeArgs(step.args, state.place) };
+  performOutcome(db, jobIds.get(record.id), body, contextFor(db, step.at, { settings }));
 }
 
 /**
- * Replay the demo into `db` (expected to have no jobs). opts: {anchor?: ISO, env?, setClock?: true}.
+ * Replay the demo into `db` (expected to have no jobs).
+ * opts: {anchor? (default: the most recent Monday 07:00, §12.1), env?, publicUrl?, setClock?: true}.
  * At the end the demo clock is set to the anchor and clock_offset_ms is saved.
  * @returns {{anchor, jobs: number, texts: number}}
  */
-export function seedDemo(db, { anchor, env = process.env, setClock = true } = {}) {
+export function seedDemo(db, { anchor, env = process.env, publicUrl = resolvePublicUrl(env), setClock = true } = {}) {
   const base = ensureSettings(db, env.BUSINESS_TZ ? { timezone: env.BUSINESS_TZ } : {});
-  const tz = base.timezone || "America/Chicago";
-  const at = anchor ?? defaultAnchor(tz);
+  const tz = base.timezone || DEFAULT_TZ;
+  const at = anchor ?? mostRecentMonday0700(new Date().toISOString(), tz);
+  const settings = { ...base, auto_ack_enabled: false };
   const state = {
-    settings: { ...base, auto_ack_enabled: false },
+    settings,
     jobIds: new Map(),
     place: placer(at, tz),
-    env,
     // Replayed texts are always simulated: never send last weekend's texts through Twilio.
-    tickDeps: { env: { PUBLIC_URL: env.PUBLIC_URL } },
+    tickDeps: { env: {}, settings, publicUrl },
   };
   for (const step of timeline(at, state.place)) runStep(db, step, state);
 
@@ -344,7 +343,7 @@ function main(argv) {
       process.exitCode = 1;
       return;
     }
-    const result = seedDemo(db, { env: process.env });
+    const result = seedDemo(db, { env: process.env, publicUrl: resolvePublicUrl(process.env, process.env.PORT || DEFAULT_PORT) });
     const tz = getSettings(db).timezone;
     console.log(`Seeded the demo: ${result.jobs} jobs, ${result.texts} texts in the outbox. Demo clock: ${shortDateLabel(result.anchor, tz)} ${timeLabel(result.anchor, tz)}.`);
   } finally {

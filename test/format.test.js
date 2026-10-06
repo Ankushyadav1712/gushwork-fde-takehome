@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  normalizePhone, phoneDisplay, money, trunc, shorten, firstName, titleFor, subtitleFor,
+  normalizePhone, phoneDisplay, money, trunc, shorten, plural, pluralWord, firstName, titleFor, subtitleFor,
   sourceLabel, channelPhrase,
 } from "../shared/format.js";
 
@@ -40,6 +40,14 @@ test("shorten prefers a clause break, else truncates", () => {
   const long = "Deli ice machine is making about half the ice it used to, and the bin is warm";
   assert.equal(shorten(long), "Deli ice machine is making about half the ice it used to");
   assert.ok(shorten("x".repeat(30) + " " + "y".repeat(40)).endsWith("…"));
+});
+
+test("plural and pluralWord", () => {
+  assert.equal(plural(1, "job", "jobs"), "1 job");
+  assert.equal(plural(3, "job", "jobs"), "3 jobs");
+  assert.equal(plural(0, "person", "people"), "0 people");
+  assert.equal(pluralWord(1, "quote", "quotes"), "quote");
+  assert.equal(pluralWord(2, "quote", "quotes"), "quotes");
 });
 
 test("titles, subtitles and source labels", () => {

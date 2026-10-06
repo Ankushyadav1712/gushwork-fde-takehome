@@ -7,13 +7,14 @@ import { openDb, get, all, run, tx, wipe, SCHEMA_VERSION } from "../server/db.js
 import {
   SETTINGS_DEFAULTS, ensureSettings, getSettings, putSettings,
   getCustomer, findCustomerByPhone, findCustomerByEmail, findCustomerByBusinessInText, matchCustomer,
-  createCustomer, fillCustomerBlanks, updateCustomer, setBlocked,
-  insertJob, getJobRow, updateJob, getJobView, getJobViews, listPastJobs, openJobsForCustomer,
-  insertMessage, updateMessage, findMessageByExternal, getMessage, listMessages, messagesForJob,
+  createCustomer, fillCustomerBlanks, updateCustomer,
+  insertJob, getJobRow, updateJob, deleteJob, getJobView, getJobViews, listPastJobs, openJobsForCustomer,
+  insertMessage, updateMessage, findMessageByExternal, getMessage, listMessages,
   unlinkedMessageCount,
-  insertEvent, listEvents, latestStateEvent, getEvent, markUndone, lastNotifiedAt,
-  insertOutbox, updateOutbox, listOutbox, outboxByDedupe,
+  insertEvent, latestStateEvent, getEvent, markUndone, updateEventSummary, deleteEventsAfter,
+  insertOutbox, updateOutbox, listOutbox, countOutboxSince, deleteOutboxAfter, getOrCreateSecret,
 } from "../server/repo.js";
+import { eventsOf, outboxRow } from "./fixtures/history.js";
 
 const A = "2026-10-05T12:00:00.000Z"; // Mon 2026-10-05 07:00 America/Chicago
 
@@ -179,6 +180,7 @@ test("ensureSettings writes the §6 defaults and a 24-char base64url readonly_ke
   assert.equal(s.auto_ack_text,
     "Hi, it's Denise at {company}. Got your message - I'll call you back as soon as I can.");
   assert.equal(s.clock_offset_ms, 0);
+  assert.equal(s.owner_email, null);
   assert.match(s.readonly_key, /^[A-Za-z0-9_-]{24}$/);
   assert.deepEqual(Object.keys(s).sort(), Object.keys(SETTINGS_DEFAULTS).sort());
   assert.equal(get(db, "SELECT count(*) AS n FROM settings").n, Object.keys(SETTINGS_DEFAULTS).length);
@@ -231,6 +233,11 @@ test("createCustomer normalises phone and email; finders match exactly", () => {
   assert.equal(findCustomerByEmail(db, "rosa@example.org"), null);
   assert.equal(getCustomer(db, 99), null);
   assert.throws(() => createCustomer(db, { phone: "+13125550118" }, A), /UNIQUE/);
+  // An address with a query, a list or spaces is not an address (security RT-4).
+  for (const email of ["chef@bistro.example?cc=billing@attacker.example", "a@b.example, c@d.example", "a b@c.example"]) {
+    assert.equal(createCustomer(db, { email }, A).email, null, email);
+  }
+  assert.equal(findCustomerByEmail(db, "rosa@example.com?bcc=x@y.example"), null);
 });
 
 test("matchCustomer: phone, then email, then business name for forwarded texts only", () => {
@@ -242,8 +249,11 @@ test("matchCustomer: phone, then email, then business name for forwarded texts o
   assert.equal(matchCustomer(db, { phone: "+13125550174" }).id, midway.id);
   // Phone wins over email when both match different customers.
   assert.equal(matchCustomer(db, { phone: "+13125550151", email: "priya.shah@freshmart.example" }).id, other.id);
-  // Unknown phone falls through to email.
-  assert.equal(matchCustomer(db, { phone: "+13125550999", email: "Priya.Shah@FreshMart.example" }).id, fresh.id);
+  // No phone: email matches. A phone that matches nobody is a different person: no email fallback (C4).
+  assert.equal(matchCustomer(db, { email: "Priya.Shah@FreshMart.example" }).id, fresh.id);
+  assert.equal(matchCustomer(db, { phone: "+13125550999", email: "Priya.Shah@FreshMart.example" }), null);
+  assert.equal(matchCustomer(db, { phone: "555-0199", email: "priya.shah@freshmart.example" }).id, fresh.id,
+    "a phone that doesn't normalize counts as no phone");
 
   const text = "Midway Meats: hey denise any update on that freezer door quote?";
   assert.equal(matchCustomer(db, { phone: null, text, forwarded: true }).id, midway.id);
@@ -267,14 +277,13 @@ test("findCustomerByBusinessInText needs exactly one customer", () => {
   assert.equal(findCustomerByBusinessInText(db, "joe's diner"), null, "two customers share the name");
 });
 
-test("blocked customers still match; setBlocked toggles the flag", () => {
+test("blocked customers still match (the caller decides what to do with them)", () => {
   const db = freshDb();
   const c = createCustomer(db, { phone: "+13125550155" }, A);
-  const blocked = setBlocked(db, c.id, true, before(-5));
+  const blocked = updateCustomer(db, c.id, { blocked: 1 }, before(-5));
   assert.equal(blocked.blocked, 1);
   assert.equal(blocked.updated_at, before(-5));
   assert.equal(matchCustomer(db, { phone: "+13125550155" }).blocked, 1);
-  assert.equal(setBlocked(db, c.id, false, A).blocked, 0);
 });
 
 test("fillCustomerBlanks never overwrites existing values", () => {
@@ -487,7 +496,6 @@ test("messages: insert, external lookup, JSON parsing, listing and unlinked coun
 
   assert.deepEqual(listMessages(db, 2).map((m) => m.id), [4, 3]);
   assert.deepEqual(listMessages(db).map((m) => m.id), [4, 3, 2, 1]);
-  assert.deepEqual(messagesForJob(db, jobId).map((m) => m.id), [m1, m2]);
 });
 
 // ---------------------------------------------------------------------------
@@ -507,7 +515,7 @@ test("events: insert with data/prev objects, newest-first listing, undo flags", 
   assert.deepEqual(got.prev, prev);
   assert.equal(got.undone, 0);
   assert.equal(getEvent(db, e1).data, null);
-  assert.deepEqual(listEvents(db, jobId).map((e) => e.id), [e2, e1]);
+  assert.deepEqual(eventsOf(db, jobId).map((e) => e.id), [e2, e1]);
   assert.equal(markUndone(db, e2), 1);
   assert.equal(getEvent(db, e2).undone, 1);
   assert.throws(() => insertEvent(db, { job_id: jobId, at: A, kind: "x", actor: "robot", summary: "s" }), /CHECK/);
@@ -525,19 +533,8 @@ test("latestStateEvent ignores notified, call_tap, text_tap, tech_text and ai_re
   }
   assert.equal(latestStateEvent(db, jobId).id, outcome);
   const inbound = insertEvent(db, { job_id: jobId, at: before(1), kind: "inbound", actor: "customer",
-    summary: "Texted: hi" });
+    summary: "Texted back" });
   assert.equal(latestStateEvent(db, jobId).id, inbound);
-});
-
-test("lastNotifiedAt returns the latest notified event time", () => {
-  const db = freshDb();
-  const c = createCustomer(db, {}, A);
-  const jobId = insertJob(db, openJob(c.id));
-  assert.equal(lastNotifiedAt(db, jobId), null);
-  insertEvent(db, { job_id: jobId, at: before(120), kind: "notified", actor: "system", summary: "Reminder texted to you" });
-  insertEvent(db, { job_id: jobId, at: before(30), kind: "notified", actor: "system", summary: "In your morning text" });
-  insertEvent(db, { job_id: jobId, at: before(1), kind: "call_tap", actor: "denise", summary: "Called" });
-  assert.equal(lastNotifiedAt(db, jobId), before(30));
 });
 
 // ---------------------------------------------------------------------------
@@ -560,56 +557,79 @@ test("outbox: dedupe_key conflicts return null; update and listing", () => {
   const sent = updateOutbox(db, id, { status: "sent", provider_id: "SM123" });
   assert.equal(sent.status, "sent");
   assert.equal(sent.provider_id, "SM123");
-  assert.equal(outboxByDedupe(db, "digest:2026-10-05").id, id);
-  assert.equal(outboxByDedupe(db, "digest:2026-10-06"), null);
+  assert.equal(outboxRow(db, "digest:2026-10-05").id, id);
   assert.deepEqual(listOutbox(db).map((o) => o.id), [manual2, manual1, id]);
   assert.deepEqual(listOutbox(db, 1).map((o) => o.id), [manual2]);
 });
 
-// --- maintenance helpers used by the scheduler, the demo clock and auth --------------------------
-import { openDb as openDbForHelpers } from "../server/db.js";
-import * as repoHelpers from "../server/repo.js";
+test("countOutboxSince counts one kind after a time, optionally to one number", () => {
+  const db = freshDb();
+  const ack = (to, minutesAgo) => insertOutbox(db, { created_at: before(minutesAgo), kind: "auto_ack", to_phone: to, body: "x", status: "simulated" });
+  ack("+13125550166", 30);
+  ack("+13125550166", 90);
+  ack("+13125550167", 10);
+  insertOutbox(db, { created_at: before(5), kind: "digest", to_phone: "+13125550100", body: "x", status: "simulated" });
+  assert.equal(countOutboxSince(db, "auto_ack", before(60)), 2);
+  assert.equal(countOutboxSince(db, "auto_ack", before(120), "+13125550166"), 2);
+  assert.equal(countOutboxSince(db, "auto_ack", before(60), "+13125550166"), 1);
+  assert.equal(countOutboxSince(db, "digest", before(1)), 0);
+});
 
-test("deleteOutboxAfter / deleteEventsAfter remove only rows after the cut", () => {
-  const db = openDbForHelpers(":memory:");
-  repoHelpers.ensureSettings(db);
-  const c = repoHelpers.createCustomer(db, { business_name: "Helper Diner" }, "2026-10-05T12:00:00.000Z").id;
-  const jobId = repoHelpers.insertJob(db, {
-    customer_id: c, stage: "new", source: "manual", created_at: "2026-10-05T12:00:00.000Z",
-    updated_at: "2026-10-05T12:00:00.000Z", stage_entered_at: "2026-10-05T12:00:00.000Z", next_due_at: "2026-10-05T12:00:00.000Z",
+// ---------------------------------------------------------------------------
+// Maintenance helpers (the scheduler, the demo clock and auth)
+
+test("deleteOutboxAfter and deleteEventsAfter remove only the rows asked for", () => {
+  const db = freshDb();
+  ensureSettings(db);
+  const c = createCustomer(db, { business_name: "Helper Diner" }, A).id;
+  const jobId = insertJob(db, {
+    customer_id: c, stage: "new", source: "manual", created_at: A,
+    updated_at: A, stage_entered_at: A, next_due_at: A,
   });
-  for (const at of ["2026-10-05T12:00:00.000Z", "2026-10-12T12:00:00.000Z"]) {
-    repoHelpers.insertOutbox(db, { created_at: at, kind: "digest", to_phone: "+13125550100", body: "x", dedupe_key: `digest:${at}`, status: "simulated" });
-    repoHelpers.insertEvent(db, { job_id: jobId, at, kind: "notified", actor: "system", summary: "In your morning text" });
-    repoHelpers.insertEvent(db, { job_id: jobId, at, kind: "outcome", actor: "denise", summary: "No answer (try 1)" });
+  for (const at of [A, "2026-10-12T12:00:00.000Z"]) {
+    insertOutbox(db, { created_at: at, kind: "digest", to_phone: "+13125550100", body: "x", dedupe_key: `digest:${at}`, status: "simulated" });
+    insertEvent(db, { job_id: jobId, at, kind: "notified", actor: "system", summary: "In your morning text" });
+    insertEvent(db, { job_id: jobId, at, kind: "outcome", actor: "denise", summary: "No answer (try 1)" });
   }
-  assert.equal(repoHelpers.deleteOutboxAfter(db, "2026-10-06T00:00:00.000Z"), 1);
-  assert.equal(repoHelpers.listOutbox(db).length, 1);
-  assert.equal(repoHelpers.deleteEventsAfter(db, "2026-10-06T00:00:00.000Z", ["notified"]), 1);
-  assert.deepEqual(repoHelpers.listEvents(db, jobId).map((e) => e.kind).sort(), ["notified", "outcome", "outcome"]);
+  assert.equal(deleteOutboxAfter(db, "2026-10-06T00:00:00.000Z"), 1);
+  assert.deepEqual(listOutbox(db).map((row) => row.created_at), [A]);
+  assert.equal(deleteEventsAfter(db, "2026-10-06T00:00:00.000Z", ["notified"]), 1);
+  assert.deepEqual(eventsOf(db, jobId).map((e) => e.kind).sort(), ["notified", "outcome", "outcome"]);
+});
+
+test("deleteJob removes the job and its history", () => {
+  const db = freshDb();
+  const c = createCustomer(db, { business_name: "Spawned Diner" }, A).id;
+  const keep = insertJob(db, openJob(c));
+  const gone = insertJob(db, openJob(c));
+  insertEvent(db, { job_id: gone, at: A, kind: "created", actor: "denise", summary: "Extra work found at the Fri visit" });
+  deleteJob(db, gone);
+  assert.equal(getJobRow(db, gone), null);
+  assert.equal(eventsOf(db, gone).length, 0);
+  assert.ok(getJobRow(db, keep));
 });
 
 test("updateEventSummary rewrites the line for one message and kind", () => {
-  const db = openDbForHelpers(":memory:");
-  const c = repoHelpers.createCustomer(db, { phone: "+13125550177" }, "2026-10-05T12:00:00.000Z").id;
-  const jobId = repoHelpers.insertJob(db, {
-    customer_id: c, stage: "new", source: "call", source_detail: "missed", created_at: "2026-10-05T12:00:00.000Z",
-    updated_at: "2026-10-05T12:00:00.000Z", stage_entered_at: "2026-10-05T12:00:00.000Z", next_due_at: "2026-10-05T12:00:00.000Z",
+  const db = freshDb();
+  const c = createCustomer(db, { phone: "+13125550177" }, A).id;
+  const jobId = insertJob(db, {
+    customer_id: c, stage: "new", source: "call", source_detail: "missed", created_at: A,
+    updated_at: A, stage_entered_at: A, next_due_at: A,
   });
-  const msg = repoHelpers.insertMessage(db, {
-    received_at: "2026-10-05T12:00:00.000Z", channel: "call", provider: "twilio", body: "", raw: {}, status: "created_job", job_id: jobId,
+  const msg = insertMessage(db, {
+    received_at: A, channel: "call", provider: "twilio", body: "", raw: {}, status: "created_job", job_id: jobId,
   });
-  repoHelpers.insertEvent(db, { job_id: jobId, at: "2026-10-05T12:00:00.000Z", kind: "created", actor: "customer", summary: "Missed call", message_id: msg });
-  assert.equal(repoHelpers.updateEventSummary(db, msg, "created", "Voicemail came in"), 1);
-  assert.equal(repoHelpers.listEvents(db, jobId)[0].summary, "Voicemail came in");
+  insertEvent(db, { job_id: jobId, at: A, kind: "created", actor: "customer", summary: "Missed call", message_id: msg });
+  assert.equal(updateEventSummary(db, msg, "created", "Voicemail came in"), 1);
+  assert.equal(eventsOf(db, jobId)[0].summary, "Voicemail came in");
 });
 
 test("getOrCreateSecret is stable and never appears in getSettings", () => {
-  const db = openDbForHelpers(":memory:");
-  repoHelpers.ensureSettings(db);
-  const a = repoHelpers.getOrCreateSecret(db, "session");
+  const db = freshDb();
+  ensureSettings(db);
+  const a = getOrCreateSecret(db, "session");
   assert.equal(typeof a, "string");
   assert.ok(a.length >= 40);
-  assert.equal(repoHelpers.getOrCreateSecret(db, "session"), a);
-  assert.ok(!JSON.stringify(repoHelpers.getSettings(db)).includes(a));
+  assert.equal(getOrCreateSecret(db, "session"), a);
+  assert.ok(!JSON.stringify(getSettings(db)).includes(a));
 });

@@ -74,13 +74,9 @@ function CopyRow({ label, value }) {
   </div>`;
 }
 
-function connectionLines(data, health) {
-  const integ = data.integrations || {};
-  const ai = integ.ai ?? health?.ai;
-  const model = integ.ai_model ?? health?.ai_model ?? "claude-opus-5-5";
-  const sms = integ.sms ?? health?.sms;
+function connectionLines({ ai, ai_model: model, sms }) {
   return {
-    reading: ai === "claude" || ai === "ai" ? `AI (${model})` : "Rules only",
+    reading: ai === "claude" ? `AI (${model})` : "Rules only",
     texts: sms === "twilio" ? "Twilio" : "Simulated (outbox)",
   };
 }
@@ -96,7 +92,7 @@ export function SettingsScreen() {
     return html`<div><${PageHeader} title="Settings" back="#/jobs" />
       ${error ? html`<${ErrorState} error=${error} onRetry=${reload} />` : html`<${Loading} />`}</div>`;
   }
-  const s = data.settings || data;
+  const s = data;
 
   async function save(partial) {
     setStatus("Saving…");
@@ -109,7 +105,7 @@ export function SettingsScreen() {
       setStatus(err.status === 0 ? ERROR_COPY : err.status === 400 ? "That didn't look right, so it wasn't saved." : "Couldn't save that change.");
     }
   }
-  const lines = connectionLines(data, app.health);
+  const lines = connectionLines(data.integrations);
   const hooks = data.webhook_urls || {};
   const techs = (s.techs || []).map((t) => ({ name: t.name || "", phone: phoneDisplay(t.phone) || t.phone || "" }));
 
@@ -121,6 +117,8 @@ export function SettingsScreen() {
       <${TextSetting} label="Your name" name="owner_name" value=${s.owner_name} onSave=${save} />
       <${TextSetting} label="Company" name="company_name" value=${s.company_name} onSave=${save} />
       <${TextSetting} label="Your cell" name="owner_phone" type="tel" value=${phoneDisplay(s.owner_phone) || s.owner_phone} onSave=${save} />
+      <${TextSetting} label="Your email" name="owner_email" type="email" value=${s.owner_email} onSave=${save}
+        hint="So emails you forward aren't mistaken for a customer." />
     </section>
 
     <section class="panel" aria-labelledby="techs-h">
@@ -154,15 +152,17 @@ export function SettingsScreen() {
         Make a new link (the old one stops working)</button>
     </section>
 
-    <section class="panel" aria-labelledby="conn-h">
-      <h2 id="conn-h" class="panel-title">Connections</h2>
+    <details class="panel setup">
+      <summary class="setup-summary"><span class="panel-title">For whoever sets this up</span>
+        <${Icon} name="chevron" size=${20} className="setup-chev" /></summary>
+      <h2 class="field-label setup-h">Connections</h2>
       <dl class="facts">
         <div><dt>Reading messages</dt><dd>${lines.reading}</dd></div>
         <div><dt>Texts</dt><dd>${lines.texts}</dd></div>
         <div><dt>"New Job" number</dt><dd>${phoneDisplay(data.forwarding_number) || data.forwarding_number || "Not set up yet"}</dd></div>
       </dl>
       ${Object.entries(hooks).map(([k, url]) => html`<${CopyRow} key=${k} label=${WEBHOOK_LABELS[k] || k} value=${url} />`)}
-    </section>
+    </details>
 
     <section class="panel" aria-labelledby="export-h">
       <h2 id="export-h" class="panel-title">Export</h2>

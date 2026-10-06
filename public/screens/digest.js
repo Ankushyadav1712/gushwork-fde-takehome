@@ -17,24 +17,37 @@ const KIND_LABELS = {
 };
 const STATUS_LABELS = { simulated: "Simulated", sent: "Sent", failed: "Failed" };
 
+/** Toast after Send now, by the outbox row's final status (§11). */
+const SEND_TOASTS = {
+  sent: "Sent to your phone.",
+  simulated: "Saved to the outbox (texts are simulated here).",
+  failed: "That text didn't go through. Check Settings.",
+};
+
 /** The weekend digest shares the `digest` kind; its body starts "Weekend check" (§11). */
 function kindLabel(item) {
   if (item.kind === "digest" && String(item.body || "").startsWith("Weekend check")) return "Weekend text";
   return KIND_LABELS[item.kind] || item.kind;
 }
 
-export function Bubble({ text }) {
+function Bubble({ text }) {
   return html`<div class="bubble"><${Linkified} text=${text} /></div>`;
 }
 
-export function OutboxList({ items }) {
+/** Her own list shows a pill only when a text didn't send; Demo controls (`allStatuses`) show every status. */
+function StatusPill({ status, allStatuses }) {
+  if (allStatuses) return html`<span class=${`status status-${status}`}>${STATUS_LABELS[status] || status}</span>`;
+  return status === "failed" ? html`<span class="status status-failed">Didn't send</span>` : null;
+}
+
+export function OutboxList({ items, allStatuses = false }) {
   if (!items?.length) return html`<p class="empty-note">Nothing sent yet.</p>`;
   return html`<ol class="outbox">
     ${items.map((m) => html`<li key=${m.id} class="outbox-item">
       <p class="outbox-meta">
         <span class="outbox-kind">${kindLabel(m)}</span>
         <span class="num">${m.at_label}</span>
-        <span class=${`status status-${m.status}`}>${STATUS_LABELS[m.status] || m.status}</span>
+        <${StatusPill} status=${m.status} allStatuses=${allStatuses} />
       </p>
       <${Bubble} text=${m.body} />
       ${m.to_name && html`<p class="muted small">To ${m.to_name}</p>`}
@@ -52,11 +65,12 @@ export function DigestScreen() {
   async function sendNow() {
     setSending(true);
     try {
-      await api.sendDigestNow();
-      app.toast("Sent to your phone.");
+      const res = await api.sendDigestNow();
+      app.toast(SEND_TOASTS[res?.status] || "Saved to the outbox.");
       outbox.reload({ quiet: true });
     } catch (err) {
-      if (err.status !== 401) app.toast(ERROR_COPY);
+      // 400 carries the reason in her words ("Add your cell in Settings first.").
+      if (err.status !== 401) app.toast(err.status === 400 ? err.message : ERROR_COPY);
     }
     setSending(false);
   }

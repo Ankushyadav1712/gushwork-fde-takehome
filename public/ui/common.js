@@ -49,8 +49,11 @@ export function Loading({ label = "Loading…" }) {
   </div>`;
 }
 
-/** Page title row with an optional back link and trailing actions. */
-export function PageHeader({ title, back, children }) {
+/**
+ * Page title row with an optional back link and trailing actions. `heading={false}` renders the
+ * title as plain text, for screens whose own content carries the page's h1.
+ */
+export function PageHeader({ title, back, heading = true, children }) {
   // Prefer the browser's back so filters and scroll position are kept; the href is the fallback.
   const goBack = (event) => {
     if (history.length > 1) {
@@ -60,13 +63,12 @@ export function PageHeader({ title, back, children }) {
   };
   return html`<header class="page-header">
     ${back && html`<a class="icon-btn back-link" href=${back} onClick=${goBack} aria-label="Back"><${Icon} name="back" /></a>`}
-    <h1 class="page-title">${title}</h1>
+    ${heading ? html`<h1 class="page-title">${title}</h1>` : html`<p class="page-title">${title}</p>`}
     ${children && html`<div class="page-header-actions">${children}</div>`}
   </header>`;
 }
 
 export const capitalize = (s) => (s ? s.charAt(0).toUpperCase() + s.slice(1) : s);
-export const plural = (n, one, many) => (n === 1 ? one : many);
 
 const URL_RE = /(https?:\/\/[^\s]+)/g;
 
@@ -106,3 +108,6 @@ export async function copyText(text) {
 
 /** sms: link in the §13.2 format, for links the UI builds itself (tech texts, Numbers). */
 export const smsHref = (phone, body) => `sms:${phone || ""}?&body=${encodeURIComponent(body || "")}`;
+
+/** mailto: link to exactly one address: "?", "&" and friends are encoded, so a sender can't add cc/bcc/body. */
+export const mailtoHref = (email) => `mailto:${encodeURIComponent(email).replace("%40", "@")}`;

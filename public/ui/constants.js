@@ -1,8 +1,5 @@
-// UI constants. Stage, lost-reason and equipment labels come from the shared rules module (§3).
-import { STAGES, OPEN_STAGES, LOST_REASONS, EQUIPMENT, isOpen, stageLabel, stageShort } from "/shared/stages.js";
-
-export { STAGES, OPEN_STAGES, LOST_REASONS, EQUIPMENT, stageLabel, stageShort };
-export const isOpenStage = isOpen;
+// UI-only constants. Stage, lost-reason and equipment labels live in /shared/stages.js (§3).
+import { EQUIPMENT } from "/shared/stages.js";
 
 /** Short reasons for Jobs rows: "lost Thu · went elsewhere". */
 const LOST_SHORT = {
@@ -23,7 +20,5 @@ export function bucketTone(bucket) {
   if (bucket === "nudge" || bucket === "quote") return "amber";
   return "accent";
 }
-
-export const DEFAULT_TZ = "America/Chicago";
 
 export const ERROR_COPY = "Can't reach Callback right now. Your list will be back when the connection is.";

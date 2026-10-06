@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import {
   parseMessage, mergeParse, parseNotebook, detectUrgency, detectEquipment, unwrapForward, replyIntent,
+  looksLikeForm, formFieldFor, isRelayAddress, normalizeEmail,
 } from "../shared/parse.js";
 
 const TZ = "America/Chicago";
@@ -444,10 +445,10 @@ test("messy: the owner's own number in the text is skipped", () => {
   assert.equal(parse("Luis says call 312-555-0121, Harbor Grill walk-in down", "manual").phone, null);
 });
 
-test("messy: forwarded email headers with display name", () => {
+test("messy: forwarded email headers give the display name but never the header address (C4)", () => {
   const text = "From: Lucia Romano <lucia@luciasmarket.example>\nTo: denise@coldfix.example\nSubject: Walk-in not cooling\n\nThe walk-in is at 45 and climbing. Please call ASAP. 312-555-0101";
   assertFields(parse(text, "email"), {
-    contact_name: "Lucia Romano", email: "lucia@luciasmarket.example", phone: "+13125550101", equipment: "walk_in_cooler",
+    contact_name: "Lucia Romano", email: null, phone: "+13125550101", equipment: "walk_in_cooler",
     urgent: true, urgent_hits: ["climbing", "asap", "not cooling"], problem: "Walk-in is at 45 and climbing",
   });
 });
@@ -566,9 +567,124 @@ test("fuzz: very long text parses quickly", () => {
   assert.ok(p.details.length <= 280);
 });
 
-test("browser-safe: imports only ./format.js and ./time.js", () => {
+test("browser-safe: imports only ./format.js, ./time.js and ./stages.js", () => {
   const source = readFileSync(new URL("../shared/parse.js", import.meta.url), "utf8");
   const imports = [...source.matchAll(/^import .* from "([^"]+)";$/gm)].map((m) => m[1]);
-  assert.deepEqual(imports, ["./format.js", "./time.js"]);
+  assert.deepEqual(imports, ["./format.js", "./time.js", "./stages.js"]);
   assert.doesNotMatch(source, /\b(?:require\(|process\.|Date\.now\(|new Date\(\))/);
+});
+
+// ---------------------------------------------------------------------------
+// Review fixes: asks, accents, form layouts, identity, notebook rows, the guard
+
+test("a sentence that starts with 'Can you' keeps what it asks for (intake RT-8)", () => {
+  assert.equal(parse("Can you come look at our ice machine tomorrow?", "sms", "+13125557801").problem,
+    "Come look at our ice machine tomorrow");
+  assertFields(parse("Could someone check our walk-in freezer, it's at 15 degrees", "sms", "+13125557802"), {
+    problem: "Check our walk-in freezer, it's at 15 degrees", urgent: true,
+  });
+  // A bare ask is skipped when a later sentence says what's wrong.
+  assert.equal(parse("Can you send someone? walk-in cooler is at 50", "sms", "+13125557803").problem, "Walk-in cooler is at 50");
+  assert.equal(parse("can you come look at the ice machine tomorrow", "sms", OWNER).problem, "Come look at the ice machine tomorrow");
+  // A trailing ask is still dropped, and so is a "call me" left without its number.
+  assert.equal(parse("Our walk-in cooler is warm, call me 312-555-0181", "email").problem, "Walk-in cooler is warm");
+});
+
+test("names and businesses with accents (intake RT-8)", () => {
+  assertFields(parse("Hi this is José at Café Olé, our reach-in is warm", "sms", "+13125557804"), {
+    contact_name: "José", business_name: "Café Olé", problem: "Reach-in is warm",
+  });
+  assertFields(parse("Hi this is Sunrise Café, our reach-in is warm", "sms", "+13125557805"), {
+    contact_name: null, business_name: "Sunrise Café", problem: "Reach-in is warm",
+  });
+  assertFields(parse("Ömer from Döner House: walk-in is down", "sms", "+13125557806"), {
+    contact_name: "Ömer", business_name: "Döner House",
+  });
+});
+
+test("form layouts: aliases, split names, label rows and single-line fields (RT-1, RT-4, RT-9)", () => {
+  assertFields(parse("You have a new form submission.\n\nFull Name: Carla Diaz\nPhone Number: (312) 555-7201\nEmail: carla@diaz.example\nComments: Display case not cooling", "email"), {
+    contact_name: "Carla Diaz", phone: "+13125557201", email: "carla@diaz.example", problem: "Display case not cooling",
+  });
+  assertFields(parse("First Name: Jo\nLast Name: King\nPhone: 312-555-0143\nMessage: reach-in not cooling", "email"), {
+    contact_name: "Jo King", phone: "+13125550143", problem: "Reach-in not cooling",
+  });
+  // HTML-table forms arrive as a label on one line and its value on the next, or label<tab>value.
+  assertFields(parse("Name\nSEO Guru\nMessage\nWe can rank your site #1 on Google", "email"), {
+    contact_name: "SEO Guru", problem: "We can rank your site #1 on Google",
+  });
+  assertFields(parse("Name\tRosa Alvarez\nPhone\t312-555-7299\nMessage\tWalk-in freezer is down, losing product", "email"), {
+    contact_name: "Rosa Alvarez", phone: "+13125557299", urgent: true,
+  });
+  // A business or phone value ends at its line; it never swallows the labels after it.
+  assertFields(parse("Business: Fox Deli\nWhat's going on?: deli case is warm\nBest time: mornings", "form"), {
+    business_name: "Fox Deli", problem: "Deli case is warm", urgent: true,
+  });
+  // A lone label word in an ordinary text is not a form.
+  assert.equal(parse("Problem\nThe walk-in is warm", "sms", "+13125550150").problem, "Problem");
+});
+
+test("looksLikeForm and formFieldFor use one label list", () => {
+  assert.equal(looksLikeForm("Thanks!\nPhone: 312-555-0142"), false);
+  assert.equal(looksLikeForm("Name: Tony Russo / Business: Tony's Bistro"), true);
+  assert.equal(looksLikeForm("name: Priya\nemail: p@x.example"), true);
+  assert.equal(looksLikeForm("Full Name: Hank Moody\nPhone Number: 312-555-0157\nHow can we help?: freezer warm"), true);
+  assert.equal(looksLikeForm("Name\nSEO Guru\nMessage\nWe can rank your site"), true);
+  assert.equal(looksLikeForm("Hi Denise, the walk-in is warm.\nCall me: 312-555-0142"), false);
+  assert.deepEqual(["Your Name", "Company Name", "Phone #", "E-mail", "What's going on?", "Last Name", "Best time"].map(formFieldFor),
+    ["contact_name", "business_name", "phone", "email", "message", "last_name", null]);
+});
+
+test("emails: one strict address, never a relay, header line or the owner's own (C4, security RT-4)", () => {
+  assert.equal(normalizeEmail(" Rosa@Example.COM "), "rosa@example.com");
+  for (const bad of ["chef@bistro.example?cc=billing@attacker.example", "a b@c.example", "a@b.example,c@d.example", "a@b", "", null, 42]) {
+    assert.equal(normalizeEmail(bad), null, String(bad));
+  }
+  const relays = ["no-reply@crm.wix.com", "noreply@x.example", "donotreply@x.example", "mailer-daemon@x.example",
+    "wordpress@frostline.example", "forms@frostline.example", "form-submission@squarespace.info",
+    "notifications@x.example", "submissions@x.example", "hello@jotform.com", "x@typeform.com", "x@formspree.io"];
+  for (const email of relays) assert.equal(isRelayAddress(email), true, email);
+  assert.equal(isRelayAddress("rosa@taqueria.example"), false);
+  assert.equal(isRelayAddress("formica@counters.example"), false);
+  assert.equal(isRelayAddress("Denise@Frostline.example", "denise@frostline.example"), true);
+
+  const pasted = "From: Frostline Website <forms@frostline.example>\nReply-To: forms@frostline.example\nSubject: New form submission\n\n"
+    + "Name: Tony Russo\nBusiness: Tony's Bistro\nPhone: (312) 555-0187\nMessage: Walk-in freezer at 10F and rising.";
+  assertFields(parse(pasted, "manual"), { email: null, contact_name: "Tony Russo", business_name: "Tony's Bistro", phone: "+13125550187" });
+  assertFields(parse("Email: forms@frostline.example\nAlso try me at ana@harbor.example", "email"), { email: "ana@harbor.example" });
+  assert.equal(parse("forward from denise@frostline.example: walk-in warm", "email", null, { owner_email: "denise@frostline.example" }).email, null);
+});
+
+test("notebook rows: the parsed phrases leave the problem; 'call back fri' is a callback day (UX-7)", () => {
+  const rows = parseNotebook([
+    "Joe's Diner walk-in, quoted 1800 tues, waiting",
+    "Fresh Mart ice machine needs scheduling",
+    "Harbor Grill reach-in needs a quote 312-555-0125",
+    "Sal's Pizza prep table scheduled thu with Luis",
+    "- Rosa's Taqueria walk-in done, $2,400",
+    "Pete's Pub ice machine leaking call back fri 312-555-0111",
+    "Marie 555-0122 reach in warm",
+  ].join("\n"), { now: NOW, tz: TZ, techs: TECHS });
+  assert.deepEqual(rows.map((r) => r.fields.problem),
+    ["Walk-in", "Ice machine", "Reach-in", "Prep table", "Walk-in", "Ice machine leaking", "Reach in warm"]);
+  assert.deepEqual(rows.map((r) => r.callback_date), [null, null, null, null, null, "2026-10-09", null]);
+  assertFields(rows[5].fields, { business_name: "Pete's Pub", phone: "+13125550111", urgent: true });
+  assertFields(rows[6].fields, { contact_name: "Marie", phone: null }); // seven digits are not a phone
+  // Quick Add keeps its text: only notebook rows are trimmed.
+  assert.equal(parse("Joe's Diner walk-in, quoted 1800 tues, waiting", "manual").problem, "Walk-in, quoted 1800 tues, waiting");
+});
+
+test("the guard: a parser error is logged by name only and the caller gets the empty result (HM-8)", () => {
+  const warn = console.warn;
+  const logged = [];
+  console.warn = (...args) => logged.push(args.join(" "));
+  try {
+    const rules = parse("walk-in cooler down", "manual");
+    const hostile = { get summary() { throw new Error("secret walk-in text"); } };
+    const merged = mergeParse(rules, hostile, "walk-in cooler down", { channel: "manual" });
+    assert.deepEqual([merged.problem, merged.parsed_by, merged.urgent_source], [rules.problem, "rules", "rules"]);
+  } finally {
+    console.warn = warn;
+  }
+  assert.deepEqual(logged, ["[parse] mergeParse failed (Error)"]);
 });

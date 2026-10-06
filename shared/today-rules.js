@@ -1,17 +1,19 @@
 // Today list rules (spec §4) plus the texts to Denise (§11). Pure: `now` and `tz` come from
-// ctx = {now, tz, settings, publicUrl}. Optional ctx.replyIntent(text) -> "yes"|"no"|null
-// (shared/parse.js); without it a local keyword check with the §8.6 regexes is used.
+// ctx = {now, tz, settings, publicUrl}.
 
-import { isOpen, DENISE_OWES, OPEN_STAGES, stageLabel, stageShort, outcomesFor, promotionFor } from "./stages.js";
+import {
+  isOpen, DENISE_OWES, OPEN_STAGES, stageLabel, stageShort, outcomesFor, promotionFor, askedForDay,
+} from "./stages.js";
 import {
   localDate, daysBetween, formatAge, dayLabel, dayTimeLabel, longDateLabel, weekdayOf,
 } from "./time.js";
 import {
-  titleFor, subtitleFor, sourceLabel, channelPhrase, phoneDisplay, money, trunc, shorten,
+  titleFor, subtitleFor, sourceLabel, channelPhrase, phoneDisplay, money, trunc, shorten, plural,
 } from "./format.js";
 import { smsDraft, smsLink, telLink } from "./templates.js";
+import { replyIntent } from "./parse.js";
 
-export const BUCKETS = Object.freeze([
+const BUCKETS = Object.freeze([
   { id: "emergency", label: "Urgent - call first" },
   { id: "replied", label: "They got back to you" },
   { id: "new", label: "New - call them back" },
@@ -22,28 +24,16 @@ export const BUCKETS = Object.freeze([
 ]);
 
 /** Buckets that weekend texts mention. */
-export const CALL_FIRST = Object.freeze(["emergency", "replied", "new"]);
+const CALL_FIRST = ["emergency", "replied", "new"];
 /** Buckets where the next move is Denise's: what the Friday sweep counts. */
 const SWEEP_BUCKETS = ["emergency", "replied", "new", "to_schedule", "quote"];
 const BUCKET_INDEX = Object.fromEntries(BUCKETS.map((b, i) => [b.id, i]));
 
 const HOUR_MS = 3_600_000;
 const DIGEST_MAX_LINES = 6;
-const DEFAULT_PUBLIC_URL = "http://localhost:3000";
-
-const YES_WORDS = /\b(yes|yep|yeah|yup|go ahead|sounds good|let'?s do it|do it|approved?|book (it|us)|deal)\b/i;
-const NO_WORDS = /\b(no thanks|not (right )?now|we'?ll pass|pass on|went with (someone|somebody|another)|found (someone|somebody)|too (much|expensive|pricey)|not interested|cancel)\b/i;
+const SWEEP_MAX_TITLES = 3;
 
 const ms = (iso) => Date.parse(iso);
-
-/** Keyword reply intent (§8.6), used when ctx.replyIntent is not supplied. */
-export function localReplyIntent(text) {
-  const s = String(text ?? "");
-  const yes = YES_WORDS.test(s);
-  const no = NO_WORDS.test(s);
-  if (yes === no) return null;
-  return yes ? "yes" : "no";
-}
 
 export function isDue(job, now) {
   return job.next_due_at != null && ms(job.next_due_at) <= ms(now);
@@ -71,11 +61,19 @@ export function bucketFor(jv, ctx) {
   }
 }
 
-/** "mark_yes" / "mark_lost" for an unread reply on a quote or waiting_yes job (§4.12), else null. */
-export function replySuggestion(jv, ctx = {}) {
-  if (jv.stage !== "waiting_yes" && jv.stage !== "quote") return null;
+/**
+ * What an unread reply suggests (§4.12): "mark_yes" / "mark_lost" on a quote or waiting_yes job,
+ * "move_day" on a scheduled job when it asks for another weekday; else null.
+ */
+export function replySuggestion(jv, ctx) {
   if (!jv.unread_inbound_at || !jv.last_inbound?.body) return null;
-  const intent = (ctx.replyIntent ?? localReplyIntent)(jv.last_inbound.body);
+  const body = jv.last_inbound.body;
+  if (jv.stage === "scheduled") {
+    const day = askedForDay(body, ctx.now, ctx.tz);
+    return day && day !== jv.visit_date ? "move_day" : null;
+  }
+  if (jv.stage !== "waiting_yes" && jv.stage !== "quote") return null;
+  const intent = replyIntent(body);
   if (intent === "yes") return "mark_yes";
   if (intent === "no") return "mark_lost";
   return null;
@@ -124,6 +122,7 @@ function inboundReason(jv, { now, tz }) {
       if (msg.call_status === "missed") return `Called ${when} (missed, no voicemail)`;
       if (msg.call_status === "answered") return `You talked ${when} - what happened?`;
       return `Called ${when}: ${quoted(msg.body)}`;
+    case "manual": return `You pasted in their message ${when}: ${quoted(msg.body)}`;
     default:
       return msg?.body ? `Wrote ${when}: ${quoted(msg.body)}` : `Got back to you ${when}`;
   }
@@ -193,7 +192,7 @@ function repliedLineReason(msg) {
 }
 
 /** The short reason used in texts to Denise (§11 "Line reasons"). */
-export function lineReason(jv, ctx, bucket = bucketFor(jv, ctx)) {
+function lineReason(jv, ctx, bucket = bucketFor(jv, ctx)) {
   switch (bucket) {
     case "emergency": return `${problem50(jv)} (URGENT)`;
     case "replied": return repliedLineReason(jv.last_inbound);
@@ -213,7 +212,7 @@ export function lineReason(jv, ctx, bucket = bucketFor(jv, ctx)) {
 // Chips (§4.7) and ordering (§4.4)
 
 /** The bucket's "waiting since" sort key: an ISO instant, or visit_date for check_done. */
-export function waitingSince(jv, bucket) {
+function waitingSince(jv, bucket) {
   switch (bucket) {
     case "emergency":
       return jv.unread_inbound_at ?? (jv.stage === "new" ? jv.created_at : jv.stage_entered_at);
@@ -253,7 +252,8 @@ export function chipFor(jv, ctx, bucket = bucketFor(jv, ctx)) {
     return chip(text, since);
   }
   if (bucket === "check_done") return null;
-  return chip(formatAge(since, now), since);
+  const age = formatAge(since, now);
+  return chip(age === "now" ? "Just now" : `Waiting ${age}`, since);
 }
 
 const sortMs = (key) => (key == null ? Infinity : ms(key));
@@ -278,7 +278,7 @@ export function compareCards(a, b) {
 function badgesFor(urgent, pastJobs) {
   const badges = [];
   if (urgent) badges.push("URGENT");
-  if (pastJobs >= 1) badges.push(`Repeat - ${pastJobs} past job${pastJobs === 1 ? "" : "s"}`);
+  if (pastJobs >= 1) badges.push(`Repeat - ${plural(pastJobs, "past job", "past jobs")}`);
   return badges;
 }
 
@@ -326,15 +326,27 @@ export function cardFor(jv, ctx) {
   };
 }
 
+/** "10 people to call"; null when there is nobody, because the empty state says it instead. */
 function headerFor(count) {
-  if (count === 0) return "All caught up";
+  if (count === 0) return null;
   return count === 1 ? "1 person to call" : `${count} people to call`;
 }
 
-/** "Last 24 hours: ..." trust line (§4.8). `not_a_job` jobs are left out. */
+/** The empty state: nothing on Today, but say so honestly when jobs are only put off. */
+function emptyStateFor(snoozed) {
+  if (snoozed > 0) {
+    return { title: "Nothing due right now.", text: `${snoozed} put off till later - they'll come back on their day.` };
+  }
+  return { title: "All caught up.", text: "Nobody's waiting on you." };
+}
+
+/**
+ * "Last 24 hours: ..." trust line (§4.8). `not_a_job` jobs are left out, and so are Brain dump
+ * imports: her notebook backlog didn't "come in" today.
+ */
 function last24hText(jobs, now) {
   const nowMs = ms(now);
-  const recent = jobs.filter((j) => j.lost_reason !== "not_a_job"
+  const recent = jobs.filter((j) => j.lost_reason !== "not_a_job" && j.source !== "bulk"
     && ms(j.created_at) > nowMs - 24 * HOUR_MS && ms(j.created_at) <= nowMs);
   if (recent.length === 0) return "Nothing new in the last 24 hours";
   const notCalled = recent.filter((j) => j.stage === "new" && !j.first_touch_at).length;
@@ -343,14 +355,10 @@ function last24hText(jobs, now) {
     : `Last 24 hours: ${recent.length} came in, ${notCalled} not called yet`;
 }
 
-/** "New 3 · Waiting on quote 3 · Their yes 2 · Said yes 2 · Scheduled 3". */
-export function stripText(stageCounts) {
-  return OPEN_STAGES.map((s) => `${stageShort(s)} ${stageCounts[s] ?? 0}`).join(" · ");
-}
-
 /**
  * The Today screen (§13.4 Today). Extra display fields: `waiting_yes_text` (header line 3,
- * null when $0), `strip` and `footer.text`. `demo` is always unshifted here; the server sets it.
+ * null when $0), `strip`, `footer.text` and `empty` (null while there are cards). `demo` is always
+ * unshifted here; the server sets it.
  */
 export function buildToday(jobViews, ctx) {
   const { now, tz } = ctx;
@@ -377,6 +385,7 @@ export function buildToday(jobViews, ctx) {
     date_label: longDateLabel(now, tz),
     count: cards.length,
     header: headerFor(cards.length),
+    empty: cards.length === 0 ? emptyStateFor(snoozed) : null,
     waiting_yes_total: waitingYesTotal,
     waiting_yes_count: waitingYes.length,
     waiting_yes_text: waitingYesTotal > 0 ? `${money(waitingYesTotal)} waiting on a yes` : null,
@@ -387,7 +396,7 @@ export function buildToday(jobViews, ctx) {
     footer: {
       scheduled_today: scheduledToday,
       snoozed,
-      text: `Scheduled today: ${scheduledToday} · Snoozed: ${snoozed}`,
+      text: `Scheduled today: ${scheduledToday} · Put off till later: ${snoozed}`,
       last24h_text: last24hText(jobViews, now),
     },
     demo: { shifted: false, label: null },
@@ -398,11 +407,36 @@ export function buildToday(jobViews, ctx) {
 // Texts to Denise (§11, §0.4)
 
 function baseUrl(ctx) {
-  return String(ctx.publicUrl || DEFAULT_PUBLIC_URL).replace(/\/+$/, "");
+  return String(ctx.publicUrl).replace(/\/+$/, "");
 }
 
 function todayCards(today) {
   return today.sections.flatMap((s) => s.items);
+}
+
+function isWeekend(ctx) {
+  const weekday = weekdayOf(localDate(ctx.now, ctx.tz));
+  return weekday === 0 || weekday === 6;
+}
+
+/** The cards the morning text is about: all of them, or on weekends the Call-first ones. */
+function digestCards(today, ctx) {
+  const cards = todayCards(today);
+  return isWeekend(ctx) ? cards.filter((c) => CALL_FIRST.includes(c.bucket)) : cards;
+}
+
+function sweepCards(today) {
+  return todayCards(today).filter((c) => SWEEP_BUCKETS.includes(c.bucket));
+}
+
+/** Job ids the morning text names on its numbered lines. */
+export function namedInDigest(today, ctx) {
+  return digestCards(today, ctx).slice(0, DIGEST_MAX_LINES).map((c) => c.job_id);
+}
+
+/** Job ids the Friday sweep names. */
+export function namedInSweep(today) {
+  return sweepCards(today).slice(0, SWEEP_MAX_TITLES).map((c) => c.job_id);
 }
 
 /** Header, up to 6 numbered lines, "+k more.", then the link, joined with "\n" (§0.4). */
@@ -419,33 +453,30 @@ function listText(header, cards, link) {
  * buckets, and only sent when there are some and `weekend_digest` is on.
  */
 export function digestText(today, ctx) {
-  const now = ctx.now ?? today.now;
-  const settings = ctx.settings ?? {};
-  const owner = settings.owner_name || "Denise";
+  const { settings } = ctx;
   const link = `${baseUrl(ctx)}/#/`;
-  const cards = todayCards(today);
-  const weekday = weekdayOf(localDate(now, ctx.tz));
-  if (weekday !== 0 && weekday !== 6) {
+  const cards = digestCards(today, ctx);
+  if (!isWeekend(ctx)) {
+    const owner = settings.owner_name;
     if (cards.length === 0) return { body: `Morning ${owner} - nobody's waiting on you today. Nice. Open: ${link}`, send: true };
     return { body: listText(`Morning ${owner} - ${cards.length} to call today:`, cards, link), send: true };
   }
-  const callFirst = cards.filter((c) => CALL_FIRST.includes(c.bucket));
-  if (callFirst.length === 0) return { body: `Weekend check - nobody's waiting on a call back. Open: ${link}`, send: false };
+  if (cards.length === 0) return { body: `Weekend check - nobody's waiting on a call back. Open: ${link}`, send: false };
   return {
-    body: listText(`Weekend check - ${callFirst.length} waiting on a call back:`, callFirst, link),
+    body: listText(`Weekend check - ${cards.length} waiting on a call back:`, cards, link),
     send: settings.weekend_digest !== false,
   };
 }
 
 /** The Friday 3pm "before the weekend" text, or null when nobody is waiting on her (or it is off). */
 export function sweepText(today, ctx) {
-  if (ctx.settings?.friday_sweep === false) return null;
-  const waiting = todayCards(today).filter((c) => SWEEP_BUCKETS.includes(c.bucket));
+  if (ctx.settings.friday_sweep === false) return null;
+  const waiting = sweepCards(today);
   if (waiting.length === 0) return null;
   const n = waiting.length;
-  const titles = waiting.slice(0, 3).map((c) => c.title).join(", ");
-  const more = n > 3 ? `, +${n - 3} more` : "";
-  return `Before the weekend: ${n} ${n === 1 ? "person" : "people"} still waiting on you - ${titles}${more}. Open: ${baseUrl(ctx)}/#/`;
+  const titles = waiting.slice(0, SWEEP_MAX_TITLES).map((c) => c.title).join(", ");
+  const more = n > SWEEP_MAX_TITLES ? `, +${n - SWEEP_MAX_TITLES} more` : "";
+  return `Before the weekend: ${plural(n, "person", "people")} still waiting on you - ${titles}${more}. Open: ${baseUrl(ctx)}/#/`;
 }
 
 /** The one-time reminder for an untouched new lead (§11). */

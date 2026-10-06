@@ -1,9 +1,11 @@
 // Brain dump (#/new/bulk): paste the notebook, check one row per line, add them all (§9, D23).
 import { html, useState } from "/vendor/preact-htm.js";
 import * as api from "../api.js";
-import { localDate, atLocal } from "/shared/time.js";
-import { useApp, PageHeader, plural } from "../ui/common.js";
-import { STAGES, ERROR_COPY } from "../ui/constants.js";
+import { localDate, atLocal, addDays } from "/shared/time.js";
+import { normalizePhone, phoneDisplay, plural } from "/shared/format.js";
+import { STAGES } from "/shared/stages.js";
+import { useApp, PageHeader } from "../ui/common.js";
+import { ERROR_COPY } from "../ui/constants.js";
 import { Icon } from "../ui/icons.js";
 
 const PLACEHOLDER = "One job per line, like: Joe's Diner walk-in, quoted 1800 tues, waiting";
@@ -14,13 +16,29 @@ function whoOf(fields = {}) {
   return fields.business_name || fields.contact_name || fields.phone || "";
 }
 
-function BulkRow({ row, index, techs, tz, onChange, onRemove }) {
+/** The phone as she typed it: shown formatted once it is a full number, saved as E.164 (or as typed until then). */
+function PhoneField({ id, phone, onSave }) {
+  const [draft, setDraft] = useState(phoneDisplay(phone) || "");
+  const commit = (value) => {
+    setDraft(value);
+    onSave(normalizePhone(value) || value.trim());
+  };
+  return html`<div class="field">
+    <label class="field-label" for=${id}>Phone</label>
+    <input id=${id} class="input" type="tel" value=${draft} autocomplete="off"
+      onInput=${(e) => commit(e.currentTarget.value)}
+      onBlur=${(e) => setDraft(phoneDisplay(normalizePhone(e.currentTarget.value)) || e.currentTarget.value)} />
+  </div>`;
+}
+
+function BulkRow({ row, index, techs, now, tz, onChange, onRemove }) {
   const id = (name) => `row-${index}-${name}`;
   const set = (patch) => onChange({ ...row, ...patch });
   const setField = (name, value) => set({ fields: { ...row.fields, [name]: value || null } });
   const setWho = (value) => setField(row.fields?.business_name || !row.fields?.contact_name ? "business_name" : "contact_name", value);
   const sentYmd = row.quote_sent_at ? localDate(row.quote_sent_at, tz) : "";
   const showAmount = row.stage === "waiting_yes" || row.stage === "done";
+  const urgent = Boolean(row.fields?.urgent);
 
   return html`<li class="panel bulk-row">
     <div class="bulk-row-head">
@@ -31,12 +49,18 @@ function BulkRow({ row, index, techs, tz, onChange, onRemove }) {
       <label class="field-label" for=${id("who")}>Who</label>
       <input id=${id("who")} class="input" value=${whoOf(row.fields)} onInput=${(e) => setWho(e.currentTarget.value)} />
     </div>
+    <${PhoneField} id=${id("phone")} phone=${row.fields?.phone} onSave=${(value) => setField("phone", value)} />
     <div class="field">
       <label class="field-label" for=${id("problem")}>What's wrong</label>
       <input id=${id("problem")} class="input" value=${row.fields?.problem || ""} onInput=${(e) => setField("problem", e.currentTarget.value)} />
     </div>
+    <div class="chip-row">
+      <button type="button" class=${`toggle-chip ${urgent ? "on urgent" : ""}`} aria-pressed=${urgent ? "true" : "false"}
+        onClick=${() => set({ fields: { ...row.fields, urgent: !urgent } })}>
+        ${urgent ? html`<${Icon} name="check" size=${18} /> URGENT` : "Mark urgent"}</button>
+    </div>
     <div class="field">
-      <label class="field-label" for=${id("stage")}>Stage</label>
+      <label class="field-label" for=${id("stage")}>Where it's at</label>
       <select id=${id("stage")} class="input" value=${row.stage} onChange=${(e) => set({ stage: e.currentTarget.value })}>
         ${ROW_STAGES.map((s) => html`<option key=${s.id} value=${s.id}>${s.label}</option>`)}
       </select>
@@ -53,6 +77,11 @@ function BulkRow({ row, index, techs, tz, onChange, onRemove }) {
           onChange=${(e) => set({ quote_sent_at: e.currentTarget.value ? atLocal(e.currentTarget.value, QUOTE_SENT_HM, tz) : null })} />
       </div>`}
     </div>
+    ${row.stage === "new" && html`<div class="field">
+      <label class="field-label" for=${id("callback")}>Call back on (optional)</label>
+      <input id=${id("callback")} class="input" type="date" min=${addDays(localDate(now, tz), 1)} value=${row.callback_date || ""}
+        onChange=${(e) => set({ callback_date: e.currentTarget.value || null })} />
+    </div>`}
     ${row.stage === "scheduled" && html`<div class="field-pair">
       <div class="field">
         <label class="field-label" for=${id("visit")}>Visit date</label>
@@ -97,7 +126,7 @@ export function BulkScreen() {
     try {
       const res = await api.createBulk(rows);
       const n = res?.created?.length ?? rows.length;
-      app.toast(`Added ${n} ${plural(n, "job", "jobs")}. They're on your list.`);
+      app.toast(`Added ${plural(n, "job", "jobs")}. They're on your list.`);
       app.changed();
       location.hash = "#/";
     } catch (err) {
@@ -123,11 +152,11 @@ export function BulkScreen() {
       <h2 class="divider" id="rows-h">${`Check these (${rows.length})`}</h2>
       ${rows.length === 0 && html`<p class="empty-note">No lines to add.</p>`}
       <ol class="bulk-rows">
-        ${rows.map((row, i) => html`<${BulkRow} key=${`${i}-${row.line}`} row=${row} index=${i} techs=${techs} tz=${app.tz}
+        ${rows.map((row, i) => html`<${BulkRow} key=${`${i}-${row.line}`} row=${row} index=${i} techs=${techs} now=${app.nowIso()} tz=${app.tz}
           onChange=${updateRow(i)} onRemove=${removeRow(i)} />`)}
       </ol>
       ${rows.length > 0 && html`<button type="button" class="btn btn-primary btn-block" disabled=${busy} onClick=${addAll}>
-        ${`Add ${rows.length} ${plural(rows.length, "job", "jobs")}`}</button>`}
+        ${`Add ${plural(rows.length, "job", "jobs")}`}</button>`}
     </section>`}
   </div>`;
 }

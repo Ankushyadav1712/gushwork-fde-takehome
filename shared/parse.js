@@ -1,25 +1,39 @@
 // Rule-based message parser: the always-on fallback behind the AI refine (SPEC §8.5-8.7).
-// Pure and browser-safe: imports only ./format.js and ./time.js, never reads the clock,
-// and never throws on any input (every export degrades to an empty result instead).
+// Pure and browser-safe: imports only ./format.js, ./time.js and ./stages.js, and never reads the
+// clock. Every public entry point that reads text runs behind one logged guard (see guard()).
 import { normalizePhone, shorten } from "./format.js";
-import { localDate, addDays, weekdayOf, atLocal } from "./time.js";
+import { localDate, addDays, weekdayOf, atLocal, DEFAULT_TZ } from "./time.js";
+import { EQUIPMENT } from "./stages.js";
 
-const DEFAULT_TZ = "America/Chicago";
 const MAX_INPUT = 20000; // longer bodies are stored verbatim by ingest; we only read the start
-const EQUIPMENT_IDS = ["walk_in_cooler", "walk_in_freezer", "ice_machine", "reach_in", "display_case", "prep_table", "other"];
+const EQUIPMENT_IDS = EQUIPMENT.map((e) => e.id);
 const URGENCY_RANK = { routine: 0, normal: 1, emergency: 2 };
 const STAGE_CHANNELS = new Set(["manual", "bulk"]); // Quick Add and Brain dump carry stage hints
+
+/**
+ * The parser's one safety net: a lead must never be lost to a parser bug (§8.5). An unexpected
+ * error is logged by name only, never with the message text, and the caller gets empty(...args).
+ */
+function guard(name, read, empty) {
+  return (...args) => {
+    try {
+      return read(...args);
+    } catch (err) {
+      console.warn(`[parse] ${name} failed (${err?.name ?? "Error"})`);
+      return empty(...args);
+    }
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Text helpers
 
+const isObject = (v) => v != null && typeof v === "object";
+
+/** Strings as given, numbers as digits; anything else reads as empty text. */
 function toText(value) {
-  if (value == null) return "";
-  try {
-    return typeof value === "string" ? value : String(value);
-  } catch {
-    return "";
-  }
+  if (typeof value === "string") return value;
+  return typeof value === "number" || typeof value === "bigint" ? String(value) : "";
 }
 
 /** Bounded, newline- and quote-normalised working copy of an input. */
@@ -27,25 +41,51 @@ function normalizeText(value) {
   return toText(value)
     .slice(0, MAX_INPUT)
     .replace(/\r\n?/g, "\n")
-    .replace(/[\u2018\u2019\u02BC]/g, "'")
-    .replace(/[\u201C\u201D]/g, "\"")
-    .replace(/[\u00A0\u2007\u202F]/g, " ");
+    .replace(/[‘’ʼ]/g, "'")
+    .replace(/[“”]/g, "\"")
+    .replace(/[   ]/g, " ");
 }
 
 const collapse = (s) => s.replace(/[ \t]+/g, " ").trim();
 const alnumLower = (s) => toText(s).toLowerCase().replace(/[^a-z0-9]/g, "");
 const digitsOf = (s) => toText(s).replace(/\D/g, "");
 const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-const wordCount = (s) => (s.match(/[A-Za-z0-9][\w'-]*/g) || []).length;
+const wordCount = (s) => (s.match(/[\p{L}\p{N}][\p{L}\p{N}_'-]*/gu) || []).length;
 const capitalize = (s) => (s ? s[0].toUpperCase() + s.slice(1) : s);
 
 // ---------------------------------------------------------------------------
 // Phones, emails, URLs
 
 const PHONE_SRC = String.raw`(?<!\d)(?:\+?1[\s.-]?)?\(?[2-9]\d{2}\)?[\s.-]?\d{3}[\s.-]?\d{4}\b`;
-// Lookbehinds make these start only at token boundaries, keeping long inputs linear.
-const EMAIL_SRC = String.raw`(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}`;
+// A seven-digit local number is never the customer's phone (§8.6), but it is still not a problem.
+const LOCAL_PHONE_SRC = String.raw`(?<![\d-])\d{3}[-.]\d{4}(?![\d-])`;
+const EMAIL_CORE = String.raw`[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}`;
+// The lookbehind makes a match start only at a token boundary, keeping long inputs linear.
+const EMAIL_SRC = String.raw`(?<![A-Za-z0-9._%+-])${EMAIL_CORE}`;
+const EMAIL_ONLY_RE = new RegExp(`^${EMAIL_CORE}$`);
+const MAX_EMAIL_LENGTH = 254;
 const URL_SRC = String.raw`\b(?:https?:\/\/|www\.)\S+`;
+
+/** Lowercased, when `value` is exactly one plain address; anything with "?", "&", "#", ",", ";" or spaces is null. */
+export function normalizeEmail(value) {
+  const s = typeof value === "string" ? value.trim() : "";
+  return s.length <= MAX_EMAIL_LENGTH && EMAIL_ONLY_RE.test(s) ? s.toLowerCase() : null;
+}
+
+const RELAY_LOCAL_RE = /^(?:no-?reply|do-?not-?reply|mailer-daemon|postmaster|wordpress|forms?|notifications?|submissions?)(?![a-z0-9])/;
+const FORM_SERVICE_RE = /(?:^|[.-])(?:wix|squarespace|jotform|wufoo|typeform|formspree|hubspot)[a-z]*(?=[.-]|$)/;
+
+/**
+ * True for an address that speaks for someone else, so it is never a customer's identity:
+ * no-reply and system mailers, website-form services, and the owner's own address.
+ */
+export function isRelayAddress(email, ownerEmail = null) {
+  const address = normalizeEmail(email);
+  if (!address) return false;
+  if (address === normalizeEmail(ownerEmail)) return true;
+  const [local, domain] = address.split("@");
+  return RELAY_LOCAL_RE.test(local) || FORM_SERVICE_RE.test(domain);
+}
 
 function findPhones(text) {
   return [...text.matchAll(new RegExp(PHONE_SRC, "g"))].map((m) => normalizePhone(m[0])).filter(Boolean);
@@ -56,12 +96,16 @@ function firstCustomerPhone(text, excluded) {
   return findPhones(text).find((p) => !excluded.has(p)) || null;
 }
 
-/** First email, skipping To:/Cc: header lines (those are usually Denise's own address). */
-function firstEmail(text) {
+// Header lines quoted inside a body ("From: Frostline Website <forms@...>") name mailers, not customers.
+const ADDRESS_HEADER_LINE_RE = /^[\s>*]*(?:from|sender|reply-to|to|cc|bcc)\*?\s*:/i;
+
+/** First customer email in the text: header lines and relay addresses are skipped. */
+function firstEmail(text, ownerEmail) {
   for (const line of text.split("\n")) {
-    if (/^\s*(?:to|cc|bcc)\s*:/i.test(line)) continue;
-    const m = new RegExp(EMAIL_SRC).exec(line);
-    if (m) return m[0].toLowerCase();
+    if (ADDRESS_HEADER_LINE_RE.test(line)) continue;
+    for (const m of line.matchAll(new RegExp(EMAIL_SRC, "g"))) {
+      if (!isRelayAddress(m[0], ownerEmail)) return m[0].toLowerCase();
+    }
   }
   return null;
 }
@@ -70,7 +114,8 @@ function removeContacts(text) {
   return text
     .replace(new RegExp(URL_SRC, "gi"), " ")
     .replace(new RegExp(EMAIL_SRC, "g"), " ")
-    .replace(new RegExp(PHONE_SRC, "g"), " ");
+    .replace(new RegExp(PHONE_SRC, "g"), " ")
+    .replace(new RegExp(LOCAL_PHONE_SRC, "g"), " ");
 }
 
 const ADDRESS_RE = /\b\d{1,6}\s+(?:[NSEW]\.?\s+)?(?:[A-Z][a-z]+\s+){1,3}(?:St|Street|Ave|Avenue|Rd|Road|Blvd|Boulevard|Dr|Drive|Ln|Lane|Way|Pkwy|Parkway|Ct|Court|Pl|Place|Hwy|Highway)\b\.?/;
@@ -105,22 +150,27 @@ const CONNECTORS = new Set(["of", "the", "and", "&"]);
 
 /** "Joe's" -> "joe", "Diner," -> "diner", "Co." -> "co". */
 const bareWord = (tok) => tok.toLowerCase().replace(/^[^\p{L}\p{N}&]+|[^\p{L}\p{N}&]+$/gu, "").replace(/'s$/, "");
-const isStopWord = (tok) => STOP_WORDS.has(tok.toLowerCase().replace(/[^a-z'-]/g, ""));
+const isStopWord = (tok) => STOP_WORDS.has(tok.toLowerCase().replace(/[^\p{L}'-]/gu, ""));
 const isBusinessWord = (tok) => BUSINESS_WORDS.has(bareWord(tok));
 const hasBusinessWord = (s) => toText(s).split(/\s+/).some(isBusinessWord);
 const isLoneBusinessWord = (s) => !s.includes(" ") && isBusinessWord(s); // "Deli:" alone names nobody
 
-const NAME = "[A-Z][a-z]+(?:[ -][A-Z][a-z]+)?";
-const BIZ = String.raw`[A-Z0-9][\w'&.#-]*(?:[ \t]+(?:[A-Z0-9#][\w'&.#-]*|(?:of|the|and)\b|&)){0,4}`;
+// Capitalised words in any script: "José", "Café Olé", "Ömer from Döner House".
+const CAPITAL_WORD = String.raw`\p{Lu}\p{Ll}+`;
+const NAME = String.raw`${CAPITAL_WORD}(?:[ -]${CAPITAL_WORD})?`;
+const NAME_END = String.raw`(?![\p{L}\p{N}_'])`;
+const BIZ_CHAR = String.raw`[\p{L}\p{N}_'&.#-]`;
+const BIZ = String.raw`[\p{Lu}\p{N}]${BIZ_CHAR}*(?:[ \t]+(?:[\p{Lu}\p{N}#]${BIZ_CHAR}*|(?:of|the|and)\b|&)){0,4}`;
 const INTRO_WORDS = "[Tt]his is|[Ii]t'?s|[Ii]t is|[Ii]'?m|[Mm]y name is";
-const INTRO_NAME_SRC = String.raw`(?:${INTRO_WORDS})\s+(${NAME})(?![\w'])(?:\s+(?:over at|at|from|with)\s+(${BIZ}))?`;
+const INTRO_NAME_SRC = String.raw`(?:${INTRO_WORDS})\s+(${NAME})${NAME_END}(?:\s+(?:over at|at|from|with)\s+(${BIZ}))?`;
 const INTRO_BIZ_SRC = String.raw`(?:${INTRO_WORDS})\s+(${BIZ})`;
-const LEAD_NAME_RE = new RegExp(String.raw`^(${NAME})(?![\w'])\s+(?:here\s+)?(?:again\s+)?(?:at|from|with)\s+(${BIZ})`);
-const LEAD_BIZ_COLON_RE = new RegExp(String.raw`^(${BIZ})\s*:(?=\s|$)`);
+const LEAD_NAME_RE = new RegExp(String.raw`^(${NAME})${NAME_END}\s+(?:here\s+)?(?:again\s+)?(?:at|from|with)\s+(${BIZ})`, "u");
+const LEAD_BIZ_COLON_RE = new RegExp(String.raw`^(${BIZ})\s*:(?=\s|$)`, "u");
+const CLEAN_NAME_RE = new RegExp(String.raw`^(${CAPITAL_WORD})(?:([ -])(${CAPITAL_WORD}))?$`, "u");
 
 /** A captured NAME, or null when it is really a common word ("I'm Calling about..."). */
 function cleanName(raw) {
-  const m = /^([A-Z][a-z]+)(?:([ -])([A-Z][a-z]+))?$/.exec(toText(raw).trim());
+  const m = CLEAN_NAME_RE.exec(toText(raw).trim());
   if (!m) return null;
   const [, first, sep, second] = m;
   if (isStopWord(first) || (first.length >= 6 && first.endsWith("ing"))) return null;
@@ -145,7 +195,7 @@ function cleanBiz(raw) {
   if (!kept.length) return null;
   let s = kept.join(" ");
   if (!/\b(?:co|inc|ltd|corp)\.$/i.test(s)) s = s.replace(/[.'#&-]+$/, "");
-  if (!/[A-Za-z]/.test(s) || normalizePhone(s)) return null;
+  if (!/\p{L}/u.test(s) || normalizePhone(s)) return null;
   return s;
 }
 
@@ -157,7 +207,7 @@ function classify(run) {
 
 /** Intro at the very start of `s`: {length, contact?, business?, droppable}. */
 function leadingIntro(s, opts = {}) {
-  let m = new RegExp(`^${INTRO_NAME_SRC}`).exec(s);
+  let m = new RegExp(`^${INTRO_NAME_SRC}`, "u").exec(s);
   if (m) {
     const name = cleanName(m[1]);
     if (name) {
@@ -167,7 +217,7 @@ function leadingIntro(s, opts = {}) {
       return withHere(s, { length: bizEnd, ...nameParts(name, biz), droppable: true });
     }
   }
-  m = new RegExp(`^${INTRO_BIZ_SRC}`).exec(s);
+  m = new RegExp(`^${INTRO_BIZ_SRC}`, "u").exec(s);
   if (m) {
     const biz = cleanBiz(m[1]);
     if (biz && hasBusinessWord(biz)) {
@@ -205,6 +255,9 @@ function withHere(s, intro) {
   return here ? { ...intro, length: intro.length + here[0].length } : intro;
 }
 
+const RUN_TOKEN_RE = /^\p{Lu}[\p{L}\p{N}_'&.-]*$/u;
+const LOWERCASE_NEXT_WORD_RE = /^[ \t]+(\p{Ll}+)(?![\p{L}\p{N}])/u;
+
 /**
  * Quick Add / notebook lines: the leading run of up to 4 capitalised tokens
  * ("Dave's Deli 312-..." -> business "Dave's Deli"; "Gus ice machine..." -> contact "Gus").
@@ -232,7 +285,7 @@ function leadingRun(s) {
   }
   if (tokens.length === 0 || (tokens.length === 1 && /^the$/i.test(tokens[0]))) return null;
   // A lowercase business word right after the run belongs to it ("Lakeview brewing").
-  const next = /^[ \t]+([a-z]+)\b/.exec(s.slice(end));
+  const next = LOWERCASE_NEXT_WORD_RE.exec(s.slice(end));
   if (next && tokens.length < 4 && isBusinessWord(next[1]) && !isBusinessWord(tokens[tokens.length - 1])) {
     tokens.push(capitalize(next[1]));
     end += next[0].length;
@@ -244,7 +297,7 @@ function leadingRun(s) {
 
 function isRunToken(tok) {
   if (tok === "&" || /^#\d+$/.test(tok)) return true;
-  if (!/^[A-Z][\w'&.-]*$/.test(tok)) return false;
+  if (!RUN_TOKEN_RE.test(tok)) return false;
   return !isStopWord(tok) || /^the$/i.test(tok);
 }
 
@@ -255,21 +308,10 @@ const FORWARD_MARKER_RE = /^\s*(?:begin forwarded message:?|-{2,}\s*original mes
 const FORWARD_PREFIX_RE = /^\s*(?:fwd?|fw)\s*:\s*/i;
 const FROM_PHONE_LINE_RE = new RegExp(
   String.raw`^\s*(?:From|FROM|from):?\s+(?:(${NAME})\s*[,-]?\s*)?((?:\+?1[\s.-]?)?\(?[2-9]\d{2}\)?[\s.-]?\d{3}[\s.-]?\d{4})\b\s*:?\s*(.*)$`,
+  "u",
 );
 
-/**
- * Strips forwarding wrappers and captures the original sender.
- * @returns {{body: string, phone: string|null, name: string|null, forwarded: boolean}}
- */
-export function unwrapForward(text, ownerPhone) {
-  try {
-    return unwrapForwardUnsafe(text, ownerPhone);
-  } catch {
-    return { body: normalizeText(text).trim(), phone: null, name: null, forwarded: false };
-  }
-}
-
-function unwrapForwardUnsafe(text, ownerPhone) {
+function readForward(text, ownerPhone) {
   const owner = normalizePhone(ownerPhone);
   let s = normalizeText(text);
   let forwarded = false;
@@ -299,41 +341,94 @@ function unwrapForwardUnsafe(text, ownerPhone) {
   return { body: lines.join("\n").trim(), phone, name, forwarded };
 }
 
+/**
+ * Strips forwarding wrappers and captures the original sender.
+ * @returns {{body: string, phone: string|null, name: string|null, forwarded: boolean}}
+ */
+export const unwrapForward = guard("unwrapForward", readForward,
+  (text) => ({ body: normalizeText(text).trim(), phone: null, name: null, forwarded: false }));
+
 // ---------------------------------------------------------------------------
 // Form labels and email headers
 
+// Label text is compared lowercased with everything but letters and digits removed ("Phone #" -> phone).
 const LABEL_FIELDS = {
   name: "contact_name", fullname: "contact_name", yourname: "contact_name", contactname: "contact_name",
-  business: "business_name", company: "business_name", restaurant: "business_name", store: "business_name",
-  businessname: "business_name", companyname: "business_name",
-  phone: "phone", phonenumber: "phone", tel: "phone", mobile: "phone",
-  email: "email", emailaddress: "email",
+  firstname: "first_name", lastname: "last_name", surname: "last_name",
+  business: "business_name", company: "business_name", companyname: "business_name", yourcompany: "business_name",
+  restaurant: "business_name", store: "business_name", businessname: "business_name",
+  phone: "phone", phonenumber: "phone", yourphone: "phone", telephone: "phone", tel: "phone", mobile: "phone", cell: "phone",
+  email: "email", emailaddress: "email", youremail: "email",
   address: "address", serviceaddress: "address", location: "address",
-  message: "message", details: "message", comments: "message", description: "message",
-  howcanwehelp: "message", issue: "message", problem: "message",
+  message: "message", yourmessage: "message", details: "message", comments: "message", description: "message",
+  howcanwehelp: "message", howcanwehelpyou: "message", whatsgoingon: "message", issue: "message", problem: "message",
 };
+// These take one line; message and address run until the next label.
+const SINGLE_LINE_FIELDS = new Set(["contact_name", "first_name", "last_name", "business_name", "phone", "email"]);
 const HEADER_KEYS = new Set(["from", "to", "cc", "bcc", "subject", "date", "sent", "replyto", "messageid"]);
-const LABEL_LINE_RE = /^\s*([A-Za-z][A-Za-z ?'/-]{0,30}?)\s*:\s*(.*)$/;
-const INLINE_LABEL_SPLIT_RE = /(?<![ \t])[ \t]+[/|][ \t]+(?=(?:name|business|company|restaurant|store|phone|email|address|message|details|comments|description|how can we help\?)\s*:)/gi;
+const LABEL_TEXT = String.raw`[A-Za-z][A-Za-z ?'/#-]{0,30}?`;
+// "Label: value", or "Label<tab>value" from an HTML table row (see server/adapters.js htmlToText).
+const LABEL_LINE_RE = new RegExp(String.raw`^\s*(${LABEL_TEXT})(?:\s*:|[ ]*\t)\s*(.*)$`);
+// A label alone on its line, its value on the next one (forms laid out as label/value rows).
+const BARE_LABEL_RE = new RegExp(String.raw`^\s*(${LABEL_TEXT})\s*:?\s*$`);
+const INLINE_LABEL_SPLIT_RE = new RegExp(String.raw`(?<![ \t])[ \t]+[/|][ \t]+(?=(${LABEL_TEXT})\s*:)`, "g");
 const labelKey = (s) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
 
-/** Splits labelled fields from the rest. A value runs until the next label line. */
+/** The form field a label names ("Phone Number" -> "phone", "Last Name" -> "last_name"), or null. */
+export function formFieldFor(label) {
+  return LABEL_FIELDS[labelKey(toText(label))] ?? null;
+}
+
+/** "Name: Tony / Business: Tony's Bistro" -> one label per line. */
+function formLines(text) {
+  return text.replace(INLINE_LABEL_SPLIT_RE, (sep, label) => (formFieldFor(label) ? "\n" : sep)).split("\n");
+}
+
+/** {field, value} for a form label line, {header, value} for an email header line, else null. */
+function readLabel(line, allowBare) {
+  const m = LABEL_LINE_RE.exec(line) ?? (allowBare ? BARE_LABEL_RE.exec(line) : null);
+  if (!m) return null;
+  const key = labelKey(m[1]);
+  const value = (m[2] ?? "").trim();
+  if (LABEL_FIELDS[key]) return { field: LABEL_FIELDS[key], value };
+  return HEADER_KEYS.has(key) ? { header: key, value } : null;
+}
+
+function labelledFields(lines, allowBare) {
+  const found = new Set();
+  for (const line of lines) {
+    const label = readLabel(line, allowBare);
+    if (label?.field) found.add(label.field);
+  }
+  return found;
+}
+
+/** Bare label lines count only in text that is clearly a form (2+ different fields labelled). */
+const isFormLayout = (lines) => labelledFields(lines, true).size >= 2;
+
+/** True when the text labels 2+ different form fields, as a website-form notification does. */
+export const looksLikeForm = guard("looksLikeForm", (text) => isFormLayout(formLines(normalizeText(text))), () => false);
+
+/** Splits labelled fields from the rest. */
 function parseLabels(body) {
+  const lines = formLines(body);
+  const allowBare = isFormLayout(lines);
   const fields = {};
   const headers = {};
   const rest = [];
-  let current = null;
-  for (const line of body.replace(INLINE_LABEL_SPLIT_RE, "\n").split("\n")) {
-    const m = LABEL_LINE_RE.exec(line);
-    const key = m ? labelKey(m[1]) : null;
-    if (key && LABEL_FIELDS[key]) {
-      current = LABEL_FIELDS[key];
-      fields[current] = m[2].trim();
-    } else if (key && HEADER_KEYS.has(key)) {
-      headers[key] = m[2].trim();
+  let current = null; // the field still collecting lines
+  for (const line of lines) {
+    const label = readLabel(line, allowBare);
+    if (label?.field) {
+      fields[label.field] = label.value;
+      current = label.value && SINGLE_LINE_FIELDS.has(label.field) ? null : label.field;
+    } else if (label?.header) {
+      headers[label.header] = label.value;
       current = null;
     } else if (current) {
-      if (line.trim()) fields[current] = fields[current] ? `${fields[current]}\n${line.trim()}` : line.trim();
+      if (!line.trim()) continue;
+      fields[current] = fields[current] ? `${fields[current]}\n${line.trim()}` : line.trim();
+      if (SINGLE_LINE_FIELDS.has(current)) current = null;
     } else {
       rest.push(line);
     }
@@ -345,21 +440,26 @@ function parseLabels(body) {
 /** Already-labelled website-form fields ({"Your Name": "...", ...}) mapped onto the same keys. */
 function formFieldValues(formFields) {
   const out = {};
-  if (!formFields || typeof formFields !== "object") return out;
+  if (!isObject(formFields)) return out;
   for (const [k, v] of Object.entries(formFields)) {
-    const field = LABEL_FIELDS[labelKey(k)];
+    const field = formFieldFor(k);
     const value = toText(v).trim();
     if (field && value && !out[field]) out[field] = normalizeText(value);
   }
   return out;
 }
 
+/** "Jo" + "King" -> "Jo King" (forms that split the name). */
+function joinName(first, last) {
+  return [first, last].map((s) => collapse(s ?? "")).filter(Boolean).join(" ") || null;
+}
+
 // ---------------------------------------------------------------------------
 // Content: the human-written part (no labels, headers, signatures or attachments)
 
 const SIGN_OFF_RE = /^(?:thanks|thank you|thx|ty|cheers|regards|best regards|best|sincerely|appreciate it)\b[\s,!.]*$/i;
-const SIGNATURE_LINE_RE = new RegExp(String.raw`^\s*[-\u2013\u2014~]\s*(${NAME})\s*(?:,\s*(${BIZ}))?\s*$`);
-const SIGN_OFF_NAME_RE = new RegExp(String.raw`^\s*(?:thanks|thank you|thx|cheers|regards|best)[,!.]?\s+(${NAME})[.!]?\s*$`, "i");
+const SIGNATURE_LINE_RE = new RegExp(String.raw`^\s*[-–—~]\s*(${NAME})\s*(?:,\s*(${BIZ}))?\s*$`, "u");
+const SIGN_OFF_NAME_RE = new RegExp(String.raw`^\s*(?:thanks|thank you|thx|cheers|regards|best)[,!.]?\s+(${NAME})[.!]?\s*$`, "iu");
 const NOISE_LINE_RE = /^\s*(?:sent from my .*|\[photo attached\]|\(voicemail - no transcript yet\))\s*$/i;
 
 /** Removes signature blocks and noise lines; returns the content and any signed name. */
@@ -391,9 +491,9 @@ function contentFrom(lines) {
 // ---------------------------------------------------------------------------
 // Names (§8.6 "Names")
 
-const EMAIL_DISPLAY_RE = /^\s*from:\s*"?([^"<\n]+?)"?\s*<[^>\n]*@[^>\n]*>/im;
+const EMAIL_DISPLAY_RE = /^\s*from:\s*"?([^"<\n]+?)"?\s*<([^>\n]*@[^>\n]*)>/im;
 
-function findNames({ content, raw, signedName, forwardName, channel }) {
+function findNames({ content, raw, signedName, forwardName, channel, ownerEmail }) {
   const out = { contact_name: null, business_name: null };
   const put = (key, value) => {
     if (value && !out[key]) out[key] = value;
@@ -414,9 +514,9 @@ function findNames({ content, raw, signedName, forwardName, channel }) {
     put("contact_name", signedName.contact);
     put("business_name", signedName.business);
   }
-  // 3. Email display name: "From: Name <email>".
+  // 3. Email display name: "From: Name <email>", unless the address is a mailer's ("Frostline Website").
   const display = EMAIL_DISPLAY_RE.exec(raw);
-  if (display) {
+  if (display && !isRelayAddress(display[2], ownerEmail)) {
     const value = collapse(display[1]);
     if (cleanName(value) === value) put("contact_name", value);
     else if (hasBusinessWord(value)) put("business_name", value);
@@ -431,11 +531,11 @@ function findNames({ content, raw, signedName, forwardName, channel }) {
 
 /** First valid "this is NAME (at BIZ)" / "it's BIZ" anywhere in the text. */
 function searchIntro(text) {
-  for (const m of text.matchAll(new RegExp(`(?<![A-Za-z'])${INTRO_NAME_SRC}`, "g"))) {
+  for (const m of text.matchAll(new RegExp(`(?<![\\p{L}'])${INTRO_NAME_SRC}`, "gu"))) {
     const name = cleanName(m[1]);
     if (name) return nameParts(name, m[2] ? cleanBiz(m[2]) : null);
   }
-  for (const m of text.matchAll(new RegExp(`(?<![A-Za-z'])${INTRO_BIZ_SRC}`, "g"))) {
+  for (const m of text.matchAll(new RegExp(`(?<![\\p{L}'])${INTRO_BIZ_SRC}`, "gu"))) {
     const biz = cleanBiz(m[1]);
     if (biz && hasBusinessWord(biz)) return { business: biz };
   }
@@ -458,16 +558,12 @@ const EQUIPMENT_RULES = [
   ["other", /\b(?:compressor|condens(?:er|ing unit)|evaporator)s?\b/i],
 ];
 
-/** First matching equipment id, or null. */
-export function detectEquipment(text) {
-  try {
-    const s = normalizeText(text);
-    for (const [id, re] of EQUIPMENT_RULES) if (re.test(s)) return id;
-  } catch {
-    // fall through
-  }
-  return null;
+function equipmentIn(s) {
+  return EQUIPMENT_RULES.find(([, re]) => re.test(s))?.[0] ?? null;
 }
+
+/** First matching equipment id, or null. */
+export const detectEquipment = guard("detectEquipment", (text) => equipmentIn(normalizeText(text)), () => null);
 
 const URGENT_RULES = [
   // Equipment down
@@ -509,16 +605,7 @@ const TEMP_RULES = [
 ];
 const COLD_HOLDING = new Set(["walk_in_cooler", "reach_in", "prep_table", "display_case"]);
 
-/** Urgency keywords and the temperature rule. Hits are in text order, lowercased. */
-export function detectUrgency(text, equipment) {
-  try {
-    return detectUrgencyUnsafe(normalizeText(text), equipment);
-  } catch {
-    return { urgent: false, hits: [] };
-  }
-}
-
-function detectUrgencyUnsafe(s, equipment) {
+function urgencyIn(s, equipment) {
   const found = [];
   for (const re of URGENT_RULES) for (const m of s.matchAll(re)) found.push({ index: m.index, text: m[0] });
   const limit = temperatureLimit(s, equipment);
@@ -539,6 +626,10 @@ function detectUrgencyUnsafe(s, equipment) {
   return { urgent: hits.length > 0, hits };
 }
 
+/** Urgency keywords and the temperature rule. Hits are in text order, lowercased. */
+export const detectUrgency = guard("detectUrgency", (text, equipment) => urgencyIn(normalizeText(text), equipment),
+  () => ({ urgent: false, hits: [] }));
+
 /** Above 10°F in a freezer, above 41°F in a cooler; no rule without equipment. */
 function temperatureLimit(s, equipment) {
   if (equipment === "walk_in_freezer" || (equipment && /\bfreez/i.test(s))) return 10;
@@ -558,9 +649,13 @@ function urgencyLevel(urgent, text) {
 
 const GREETING_RE = /^(?:hi|hey|hello|hiya|yo|good (?:morning|afternoon|evening))\b[,!.]?\s*(?:(?:denise|there|guys|all)\b[,!.]?\s*)?/i;
 const LEADING_FILLER_RE = /^(?:our|my|the)\s+/i;
-const LEADING_ASK_RE = /^(?:wants|needs|is asking for|asking for|looking for|would like|want|need)\s+/i;
+const LEADING_WANT_RE = /^(?:wants|needs|is asking for|asking for|looking for|would like|want|need)\s+/i;
 const LEADING_ARTICLE_RE = /^(?:a|an|the)\s+/i;
-const TRAILING_ASK_RE = /,?\s*\b(?:can|could|would|will) (?:you|someone|somebody|u)\b.*$/i;
+const ASK_SRC = String.raw`(?:can|could|would|will) (?:you(?: guys| all)?|someone|somebody|u)\b`;
+const TRAILING_ASK_RE = new RegExp(String.raw`,?\s*\b${ASK_SRC}.*$`, "i");
+const LEADING_ASK_RE = new RegExp(String.raw`^(?:please\s+)?${ASK_SRC}\s*(?:please\s+)?`, "i");
+// What is left of "..., call me at 312-555-0181" once the number is removed.
+const TRAILING_CALL_ME_RE = /,?\s*\b(?:please\s+)?call (?:me|us)(?: back)?(?: (?:at|on))?$/i;
 
 const stripGreeting = (s) => s.replace(GREETING_RE, "").trim();
 
@@ -590,11 +685,25 @@ function mergeFalseBreaks(parts) {
 const stripEndPunct = (s) => s.replace(/(?<![^\p{L}\p{N})\]%"'])[^\p{L}\p{N})\]%"']+$/u, "");
 const isSignOffSentence = (s) => SIGN_OFF_RE.test(s) || SIGN_OFF_NAME_RE.test(s) || /^-+$/.test(s);
 
-/** Problem (<= 60 chars) and details (the original sentences after it) from the content. */
-function summarize(content, { leadingRun: useRun, address }) {
+/** "Can you send someone?" asks for help without saying what for. */
+function isBareAsk(s) {
+  const ask = LEADING_ASK_RE.exec(s);
+  return ask != null && wordCount(s.slice(ask[0].length)) < 3;
+}
+
+/**
+ * Problem (<= 60 chars) and details (the original sentences after it) from the content.
+ * `strip` (notebook lines) removes phrases already read into other fields.
+ */
+function summarize(content, { leadingRun: useRun, address, strip }) {
   const originals = splitSentences(content);
   const cleaned = originals.map((s) => collapse(removeContacts(address ? s.split(address).join(" ") : s)));
   const isMeaningful = (x) => x && !isSignOffSentence(x);
+  const moreAfter = []; // moreAfter[i]: a meaningful sentence follows sentence i
+  for (let i = cleaned.length - 1, seen = false; i >= 0; i--) {
+    moreAfter[i] = seen;
+    seen ||= Boolean(isMeaningful(cleaned[i]));
+  }
   for (let i = 0; i < cleaned.length; i++) {
     let s = stripGreeting(stripEndPunct(cleaned[i]));
     if (!s) continue;
@@ -602,14 +711,13 @@ function summarize(content, { leadingRun: useRun, address }) {
     if (intro) {
       let rest = s.slice(intro.length);
       const afterComma = /^\s*,/.test(rest);
-      rest = stripGreeting(rest.replace(/^[\s,:;.!\u2013\u2014-]+/, ""));
+      rest = stripGreeting(rest.replace(/^[\s,:;.!–—-]+/, ""));
       if (!rest) continue;
-      const hasMore = cleaned.slice(i + 1).some(isMeaningful);
-      if (intro.droppable && !afterComma && wordCount(rest) < 4 && hasMore) continue;
+      if (intro.droppable && !afterComma && wordCount(rest) < 4 && moreAfter[i]) continue;
       s = rest;
     }
-    if (isSignOffSentence(s)) continue;
-    const problem = finishProblem(s);
+    if (isSignOffSentence(s) || (isBareAsk(s) && moreAfter[i])) continue;
+    const problem = finishProblem(strip ? strip(s) : s);
     if (!problem) continue;
     const details = originals.slice(i + 1).filter(isMeaningful).join(" ");
     return { problem, details: details ? shorten(details, 280) : null };
@@ -627,11 +735,17 @@ function looseIntro(s) {
   return { length: m[0].length, droppable: false };
 }
 
+/** Drops the ask: a leading "Can you" ("Can you come look at it" -> "come look at it"), else a trailing ", can someone come?". */
+function withoutAsk(s) {
+  const ask = LEADING_ASK_RE.exec(s);
+  return ask ? s.slice(ask[0].length) : s.replace(TRAILING_ASK_RE, "");
+}
+
 function finishProblem(sentence) {
   let s = sentence.replace(LEADING_FILLER_RE, "");
-  s = s.replace(LEADING_ASK_RE, "").replace(LEADING_ARTICLE_RE, "");
-  s = s.replace(TRAILING_ASK_RE, "");
-  s = stripEndPunct(s).replace(/\s+(?:at|on|@)$/i, "");
+  s = s.replace(LEADING_WANT_RE, "").replace(LEADING_ARTICLE_RE, "");
+  s = withoutAsk(s);
+  s = stripEndPunct(s).replace(TRAILING_CALL_ME_RE, "").replace(/\s+(?:at|on|@)$/i, "");
   s = stripEndPunct(collapse(s));
   if (!s || !/[\p{L}\p{N}]/u.test(s)) return null;
   return capitalize(shorten(s, 60));
@@ -647,12 +761,7 @@ const CALLBACK_RE = new RegExp(String.raw`\bcall (?:(?:me|him|her|them|us) )?(?:
 const MONTH_DAY_RE = /(?<![\d/])(1[0-2]|0?[1-9])\/(3[01]|[12]\d|0?[1-9])(?:\/(\d{2}|\d{4}))?(?![\d/])/;
 
 function todayOf(ctx) {
-  if (!ctx.now) return null;
-  try {
-    return localDate(ctx.now, ctx.tz || DEFAULT_TZ);
-  } catch {
-    return null;
-  }
+  return ctx.now ? localDate(ctx.now, ctx.tz || DEFAULT_TZ) : null;
 }
 
 /** The first date on or after (or strictly after) `today` with weekday `wd`. */
@@ -783,8 +892,41 @@ function techIn(text, techs) {
   return best ? best.name : null;
 }
 
+// Notebook lines: what stageFields and callbackDate read, so the row's problem doesn't repeat it
+// ("Joe's Diner walk-in, quoted 1800 tues, waiting" -> "Walk-in").
+const ON_DAY_SRC = String.raw`(?:\b(?:on|for|next|this)\s+)?`;
+const NOTEBOOK_PHRASES = {
+  every: [DOLLAR_AMOUNT_RE, CALLBACK_RE],
+  waiting_yes: [K_AMOUNT_RE, BARE_AMOUNT_RE, /\bwaiting\b(?: on (?:their |the |a )?(?:yes|answer|reply))?/,
+    new RegExp(ON_DAY_SRC + DAY_SRC), /\byesterday\b/],
+  scheduled: [new RegExp(ON_DAY_SRC + DAY_SRC), new RegExp(String.raw`${ON_DAY_SRC}\b(?:today|tomorrow)\b`),
+    new RegExp(ON_DAY_SRC + MONTH_DAY_RE.source)],
+};
+
+function notebookPhrases(stage, techs) {
+  const stageWords = STAGE_RULES.find(([id]) => id === stage)?.[1];
+  const techNames = stage === "scheduled"
+    ? techList(techs).map((t) => new RegExp(String.raw`(?:\b(?:with|w\/)\s+)?\b${escapeRe(t.name.trim())}\b`))
+    : [];
+  return [...NOTEBOOK_PHRASES.every, ...(stageWords ? [stageWords] : []), ...(NOTEBOOK_PHRASES[stage] ?? []), ...techNames];
+}
+
+function withoutNotebookPhrases(s, stage, techs) {
+  let out = s;
+  for (const re of notebookPhrases(stage, techs)) out = out.replace(new RegExp(re.source, "gi"), " ");
+  return collapse(out)
+    .replace(/\s+([,;:])/g, "$1")
+    .replace(/([,;:])(?:\s*[,;:])+/g, "$1")
+    .replace(/^[\s,;:.-]+/, "");
+}
+
 // ---------------------------------------------------------------------------
 // parseMessage
+
+/** The Parse fields a Quick Add or Brain dump preview shows and saves (server and browser share this list). */
+export const PARSE_FIELDS = Object.freeze([
+  "contact_name", "business_name", "phone", "email", "address", "equipment", "problem", "details", "urgent",
+]);
 
 function emptyParse() {
   return {
@@ -795,49 +937,37 @@ function emptyParse() {
   };
 }
 
-/**
- * Rule-based parse of one inbound message or Quick Add text.
- * @param {string} text
- * @param {{channel?, from_phone?, owner_phone?, twilio_from?, form_fields?, techs?, now?, tz?}} [opts]
- *   A missing channel is treated like Quick Add ('manual'): stage hints and the leading-name rule apply.
- * @returns {object} Parse (see SPEC §8.6); never throws.
- */
-export function parseMessage(text, opts) {
-  try {
-    return parseMessageUnsafe(text, opts && typeof opts === "object" ? opts : {});
-  } catch {
-    return emptyParse();
-  }
-}
-
-function parseMessageUnsafe(text, opts) {
+function readMessage(text, opts) {
   const channel = opts.channel ?? null;
   const owner = normalizePhone(opts.owner_phone);
+  const ownerEmail = opts.owner_email ?? null;
   const excluded = new Set([owner, normalizePhone(opts.twilio_from), ...techList(opts.techs).map((t) => normalizePhone(t.phone))].filter(Boolean));
 
-  const fwd = unwrapForward(text, owner);
+  const fwd = readForward(text, owner);
   const { fields: labelled, headers, rest } = parseLabels(fwd.body);
   const fields = { ...labelled, ...formFieldValues(opts.form_fields) };
   const { content: freeText, signedName } = contentFrom(rest);
   const content = fields.message || freeText || headers.subject || "";
 
-  const names = findNames({ content, raw: fwd.body, signedName, forwardName: fwd.name, channel });
-  const contact_name = fields.contact_name ? collapse(fields.contact_name) : names.contact_name;
+  const names = findNames({ content, raw: fwd.body, signedName, forwardName: fwd.name, channel, ownerEmail });
+  const contact_name = fields.contact_name ? collapse(fields.contact_name) : joinName(fields.first_name, fields.last_name) ?? names.contact_name;
   const business_name = fields.business_name ? collapse(fields.business_name) : names.business_name;
 
   const detection = withoutNames(removeContacts([content, headers.subject].filter(Boolean).join("\n")), [contact_name, business_name]);
-  const equipment = detectEquipment(detection);
-  const { urgent, hits } = detectUrgency(detection, equipment);
+  const equipment = equipmentIn(detection);
+  const { urgent, hits } = urgencyIn(detection, equipment);
   const address = fields.address ? collapse(fields.address) : (ADDRESS_RE.exec(content)?.[0] ?? null);
-  const { problem, details } = summarize(content, { leadingRun: isStageChannel(channel), address });
   const today = todayOf(opts);
+  const stage = isStageChannel(channel) ? stageFields(detection, content, today, opts) : null;
+  const strip = channel === "bulk" ? (s) => withoutNotebookPhrases(s, stage.stage_hint, opts.techs) : null;
+  const { problem, details } = summarize(content, { leadingRun: isStageChannel(channel), address, strip });
 
-  const parse = {
+  return {
     ...emptyParse(),
     contact_name: contact_name || null,
     business_name: business_name || null,
     phone: pickPhone({ channel, sender: normalizePhone(opts.from_phone), fwd, fields, body: fwd.body, excluded }),
-    email: fields.email ? firstEmail(fields.email) || fields.email.trim().toLowerCase() : firstEmail(fwd.body),
+    email: firstEmail(fields.email ?? "", ownerEmail) ?? firstEmail(fwd.body, ownerEmail),
     address,
     equipment,
     problem,
@@ -846,10 +976,18 @@ function parseMessageUnsafe(text, opts) {
     urgent_hits: hits,
     urgency: urgencyLevel(urgent, detection),
     callback_date: callbackDate(detection, today),
+    ...stage,
   };
-  if (isStageChannel(channel)) Object.assign(parse, stageFields(detection, content, today, opts));
-  return parse;
 }
+
+/**
+ * Rule-based parse of one inbound message or Quick Add text.
+ * @param {string} text
+ * @param {{channel?, from_phone?, owner_phone?, owner_email?, twilio_from?, form_fields?, techs?, now?, tz?}} [opts]
+ *   A missing channel is treated like Quick Add ('manual'): stage hints and the leading-name rule apply.
+ * @returns {object} Parse (see SPEC §8.6)
+ */
+export const parseMessage = guard("parseMessage", (text, opts) => readMessage(text, isObject(opts) ? opts : {}), emptyParse);
 
 /** SMS/call sender, then the forwarded sender, then the Phone: field, then the first number in the text. */
 function pickPhone({ channel, sender, fwd, fields, body, excluded }) {
@@ -886,29 +1024,19 @@ function nationalDigits(e164) {
 
 const nonEmpty = (v) => (typeof v === "string" && v.trim() ? v.trim() : null);
 
-/**
- * Combines the rules parse with an AI extraction under the §8.5 guardrails.
- * @returns Parse + {urgent_source, ai_not_service, urgency_reason, parsed_by}
- */
-export function mergeParse(rules, ai, raw, opts) {
-  const base = { ...emptyParse(), ...(rules && typeof rules === "object" ? rules : {}) };
-  try {
-    return mergeParseUnsafe(base, ai, raw, opts && typeof opts === "object" ? opts : {});
-  } catch {
-    return { ...base, urgent_source: base.urgent ? "rules" : null, ai_not_service: 0, urgency_reason: null, parsed_by: "rules" };
-  }
+/** The rules parse in merged form, as when the AI added nothing. */
+function rulesOnly(rules) {
+  const base = { ...emptyParse(), ...(isObject(rules) ? rules : {}) };
+  return {
+    ...base, urgent: Boolean(base.urgent), urgent_source: base.urgent ? "rules" : null,
+    ai_not_service: 0, urgency_reason: null, parsed_by: "rules",
+  };
 }
 
-function mergeParseUnsafe(rules, ai, raw, opts) {
-  const merged = {
-    ...rules,
-    urgent: Boolean(rules.urgent),
-    urgent_source: rules.urgent ? "rules" : null,
-    ai_not_service: 0,
-    urgency_reason: null,
-    parsed_by: "rules",
-  };
-  if (!ai || typeof ai !== "object") return merged;
+function mergeWithAI(rules, ai, raw, rawOpts) {
+  const opts = isObject(rawOpts) ? rawOpts : {};
+  const merged = rulesOnly(rules);
+  if (!isObject(ai)) return merged;
 
   const rawText = normalizeText(raw);
   const rawAlnum = alnumLower(rawText);
@@ -922,19 +1050,21 @@ function mergeParseUnsafe(rules, ai, raw, opts) {
   const sender = normalizePhone(opts.from_phone);
   const excluded = new Set([normalizePhone(opts.owner_phone), normalizePhone(opts.twilio_from)].filter(Boolean));
   if ((opts.channel === "sms" || opts.channel === "call") && sender && !excluded.has(sender)) merged.phone = sender;
-  else if (!rules.phone) {
-    const aiPhone = normalizePhone(ai.phone);
+  else if (!merged.phone) {
+    const aiPhone = normalizePhone(nonEmpty(ai.phone));
     if (aiPhone && !excluded.has(aiPhone) && digitsOf(rawText).includes(nationalDigits(aiPhone))) accept("phone", aiPhone);
   }
 
-  // Email: the rules regex wins; an AI email must appear verbatim (ignoring case).
-  const aiEmail = nonEmpty(ai.email);
-  if (!rules.email && aiEmail && rawText.toLowerCase().includes(aiEmail.toLowerCase())) accept("email", aiEmail.toLowerCase());
+  // Email: the rules regex wins; an AI email must be a plain customer address that appears verbatim.
+  const aiEmail = normalizeEmail(ai.email);
+  if (!merged.email && aiEmail && !isRelayAddress(aiEmail, opts.owner_email) && rawText.toLowerCase().includes(aiEmail)) {
+    accept("email", aiEmail);
+  }
 
   // Names and address: accepted only when grounded in the raw text. Blank beats wrong.
   for (const key of ["contact_name", "business_name", "address"]) {
     const value = nonEmpty(ai[key]);
-    if (value && grounded(value, rawAlnum) && value !== rules[key]) accept(key, value);
+    if (value && grounded(value, rawAlnum) && value !== merged[key]) accept(key, value);
   }
 
   const summary = nonEmpty(ai.summary);
@@ -942,17 +1072,18 @@ function mergeParseUnsafe(rules, ai, raw, opts) {
   const details = nonEmpty(ai.details);
   if (details) accept("details", details);
 
-  if ((!rules.equipment || rules.equipment === "other") && EQUIPMENT_IDS.includes(ai.equipment) && ai.equipment !== rules.equipment) {
+  if ((!merged.equipment || merged.equipment === "other") && EQUIPMENT_IDS.includes(ai.equipment) && ai.equipment !== merged.equipment) {
     accept("equipment", ai.equipment);
   }
 
   // Urgency: AI can raise it, never lower it.
-  if (!rules.urgent && ai.urgency === "emergency") {
+  const rulesUrgent = merged.urgent;
+  if (!rulesUrgent && ai.urgency === "emergency") {
     merged.urgent = true;
     merged.urgent_source = "ai";
     accepted.push("urgent");
   }
-  const ruleLevel = rules.urgent ? "emergency" : URGENCY_RANK[rules.urgency] != null ? rules.urgency : "normal";
+  const ruleLevel = rulesUrgent ? "emergency" : URGENCY_RANK[merged.urgency] != null ? merged.urgency : "normal";
   const aiLevel = URGENCY_RANK[ai.urgency] != null ? ai.urgency : ruleLevel;
   merged.urgency = merged.urgent ? "emergency" : URGENCY_RANK[aiLevel] > URGENCY_RANK[ruleLevel] ? aiLevel : ruleLevel;
   merged.urgency_reason = nonEmpty(ai.urgency_reason);
@@ -962,40 +1093,46 @@ function mergeParseUnsafe(rules, ai, raw, opts) {
   return merged;
 }
 
+/**
+ * Combines the rules parse with an AI extraction under the §8.5 guardrails.
+ * opts: {channel, from_phone?, owner_phone?, owner_email?, twilio_from?}
+ * @returns Parse + {urgent_source, ai_not_service, urgency_reason, parsed_by}
+ */
+export const mergeParse = guard("mergeParse", mergeWithAI, rulesOnly);
+
 // ---------------------------------------------------------------------------
 // parseNotebook (Brain dump)
 
 const BULLET_RE = /^\s*(?:[-*•]+|\d{1,3}[.)])\s+/;
 
+function readNotebook(text, ctx) {
+  const c = isObject(ctx) ? ctx : {};
+  const opts = {
+    channel: "bulk",
+    now: c.now,
+    tz: c.tz || c.settings?.timezone,
+    techs: c.techs ?? c.settings?.techs,
+    owner_phone: c.owner_phone ?? c.settings?.owner_phone,
+    owner_email: c.owner_email ?? c.settings?.owner_email,
+  };
+  return normalizeText(text)
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const fields = parseMessage(line.replace(BULLET_RE, ""), opts);
+      const { stage_hint: stage, quote_amount, quote_sent_at, visit_date, tech, callback_date } = fields;
+      return { line, fields, stage: stage || "new", quote_amount, quote_sent_at, visit_date, tech, callback_date };
+    });
+}
+
 /**
  * One row per non-empty notebook line.
  * @param {string} text
- * @param {{now, tz, techs?, owner_phone?, settings?}} ctx
- * @returns {{line, fields, stage, quote_amount, quote_sent_at, visit_date, tech}[]}
+ * @param {{now, tz, techs?, owner_phone?, owner_email?, settings?}} ctx
+ * @returns {{line, fields, stage, quote_amount, quote_sent_at, visit_date, tech, callback_date}[]}
  */
-export function parseNotebook(text, ctx) {
-  try {
-    const c = ctx && typeof ctx === "object" ? ctx : {};
-    const opts = {
-      channel: "bulk",
-      now: c.now,
-      tz: c.tz || c.settings?.tz,
-      techs: c.techs ?? c.settings?.techs,
-      owner_phone: c.owner_phone ?? c.settings?.owner_phone,
-    };
-    return normalizeText(text)
-      .split("\n")
-      .map((l) => l.trim())
-      .filter(Boolean)
-      .map((line) => {
-        const fields = parseMessage(line.replace(BULLET_RE, ""), opts);
-        const { stage_hint: stage, quote_amount, quote_sent_at, visit_date, tech } = fields;
-        return { line, fields, stage: stage || "new", quote_amount, quote_sent_at, visit_date, tech };
-      });
-  } catch {
-    return [];
-  }
-}
+export const parseNotebook = guard("parseNotebook", readNotebook, () => []);
 
 // ---------------------------------------------------------------------------
 // replyIntent (§4.12, D14: keywords, never AI)
@@ -1003,15 +1140,12 @@ export function parseNotebook(text, ctx) {
 const YES_RE = /\b(?:yes|yep|yeah|yup|go ahead|sounds good|let'?s do it|do it|approved?|book (?:it|us)|deal)\b/i;
 const NO_RE = /\b(?:no thanks|not (?:right )?now|we'?ll pass|pass on|went with (?:someone|somebody|another)|found (?:someone|somebody)|too (?:much|expensive|pricey)|not interested|cancel)\b/i;
 
-/** 'yes' | 'no' | null (both or neither). */
-export function replyIntent(text) {
-  try {
-    const s = normalizeText(text);
-    const yes = YES_RE.test(s);
-    const no = NO_RE.test(s);
-    if (yes === no) return null;
-    return yes ? "yes" : "no";
-  } catch {
-    return null;
-  }
+function intentOf(s) {
+  const yes = YES_RE.test(s);
+  const no = NO_RE.test(s);
+  if (yes === no) return null;
+  return yes ? "yes" : "no";
 }
+
+/** 'yes' | 'no' | null (both or neither). */
+export const replyIntent = guard("replyIntent", (text) => intentOf(normalizeText(text)), () => null);

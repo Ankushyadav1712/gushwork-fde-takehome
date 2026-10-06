@@ -43,7 +43,7 @@ test("sends a structured-output request and normalizes the parsed result", async
   const { url, headers, body } = calls[0];
   assert.match(url, /\/v1\/messages/);
   assert.match(headers.get("anthropic-beta") || "", /server-side-fallback-2026-07-01/);
-  assert.equal(body.model, "claude-opus-5-5");
+  assert.equal(body.model, "claude-sonnet-5-5");
   assert.equal(body.fallbacks, "default");
   assert.equal(body.output_config.effort, "low");
   assert.equal(body.output_config.format.type, "json_schema");

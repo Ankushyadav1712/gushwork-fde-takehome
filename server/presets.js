@@ -1,18 +1,12 @@
 // Live demo presets (SPEC §12.6): provider-shaped payloads, so the simulator exercises the real
 // adapters and the real ingest(). buildCustom() does the same for the simulator's custom form.
 import { createHash, randomBytes } from "node:crypto";
+import { INBOUND_PATHS } from "./routes/inbound.js";
 
 /** The Twilio "New Job" number the demo payloads are addressed to (fictional). */
-export const DEMO_TWILIO_NUMBER = "+13125550105";
+const DEMO_TWILIO_NUMBER = "+13125550105";
 const DEMO_ACCOUNT_SID = `AC${"0".repeat(32)}`;
 const FORM_SENDER = { Email: "forms@frostline.example", Name: "Frostline Website" };
-
-export const ROUTE_PATHS = Object.freeze({
-  sms: "/api/inbound/sms",
-  call: "/api/inbound/call",
-  email: "/api/inbound/email",
-  form: "/api/inbound/form",
-});
 
 const FORM_URLENCODED = "application/x-www-form-urlencoded";
 const JSON_TYPE = "application/json";
@@ -38,6 +32,11 @@ function twilioCall({ sid, from, to = DEMO_TWILIO_NUMBER, ...rest }) {
   return { CallSid: sid, AccountSid: DEMO_ACCOUNT_SID, From: from, To: to, Direction: "inbound", ApiVersion: "2010-04-01", ...rest };
 }
 
+/** The <Dial> action callback of a call she picked up (Phase 2 routing, §7.6). */
+function answeredFields(seconds) {
+  return { CallStatus: "in-progress", DialCallStatus: "completed", DialCallDuration: String(seconds) };
+}
+
 function voicemailFields(sid, transcript) {
   return {
     CallStatus: "completed",
@@ -58,8 +57,8 @@ function postmarkEmail({ messageId, from = FORM_SENDER, subject, text }) {
   };
 }
 
-const twilioRequest = (route, body) => ({ route, path: ROUTE_PATHS[route], contentType: FORM_URLENCODED, body });
-const jsonRequest = (route, body) => ({ route, path: ROUTE_PATHS[route], contentType: JSON_TYPE, body });
+const twilioRequest = (route, body) => ({ route, path: INBOUND_PATHS[route], contentType: FORM_URLENCODED, body });
+const jsonRequest = (route, body) => ({ route, path: INBOUND_PATHS[route], contentType: JSON_TYPE, body });
 
 const TONY_FORM = [
   "Name: Tony Russo",
@@ -70,58 +69,51 @@ const TONY_FORM = [
 
 const CARLA_TRANSCRIPT = "Hey it's Carla from Westside Diner, our ice machine is leaking all over the kitchen floor. Call me back at 312-555-0164.";
 
-/** Each preset: id, label for the simulator button, the expected result, and its payload builder. */
+/** Each preset: id, the simulator button's label and note (what should happen), and its payload builder. */
 const DEFINITIONS = [
   {
-    id: "rosa_yes", label: "Rosa texts back: yes",
-    expected: "Attaches to Rosa's Taqueria's quote. Shows under They got back to you with \"Mark as yes?\".",
+    id: "rosa_yes", label: "Rosa texts \"yes go ahead\"", note: "Attaches to her quote; suggests Mark as yes",
     build: () => twilioRequest("sms", twilioSms({ sid: stableSid("SM", "rosa_yes"), from: "+13125550118",
       body: "yes go ahead, thursday works for us" })),
   },
   {
-    id: "lucia_repeat", label: "Lucia texts again",
-    expected: "New job \"Lucia's Market\" with \"Repeat - 1 past job\", source Text.",
+    id: "lucia_repeat", label: "Lucia's Market texts again", note: "New job, Repeat - 1 past job",
     build: () => twilioRequest("sms", twilioSms({ sid: stableSid("SM", "lucia_repeat"), from: "+13125550101",
       body: "ice machine acting up again, can someone come this week?" })),
   },
   {
-    id: "web_form_tony", label: "Web form: Tony's Bistro",
-    expected: "New urgent job from the web form. Sending it again returns duplicate.",
+    id: "web_form_tony", label: "Web form: Tony's Bistro", note: "Freezer at 10F and rising; urgent",
     build: () => jsonRequest("email", postmarkEmail({ messageId: "<web-form-tony-bistro@frostline.example>",
       subject: "New website form submission", text: TONY_FORM })),
   },
   {
-    id: "voicemail_carla", label: "Voicemail: Carla, Westside Diner",
-    expected: "New urgent job (leaking), source Voicemail.",
+    id: "voicemail_carla", label: "Voicemail: Westside Diner", note: "Ice machine leaking; urgent",
     build: () => {
       const sid = stableSid("CA", "voicemail_carla");
       return twilioRequest("call", twilioCall({ sid, from: "+13125550164", ...voicemailFields(sid, CARLA_TRANSCRIPT) }));
     },
   },
   {
-    id: "forward_midway", label: "Denise forwards a Midway Meats text",
-    expected: "Matched by business name and attached to Midway Meats (They got back to you).",
+    id: "forward_midway", label: "You forward Midway Meats' text", note: "Matched by business name",
     build: ({ settings }) => twilioRequest("sms", twilioSms({ sid: stableSid("SM", "forward_midway"),
       from: settings?.owner_phone ?? "+13125550100",
       body: "Midway Meats: hey denise any update on that freezer door quote?" })),
   },
   {
-    id: "spam_call", label: "Answered call, 8 seconds",
-    expected: "Ignored (answered calls under 15 seconds create nothing).",
+    id: "spam_call", label: "Answered call, 8 seconds", note: "Ignored",
     build: () => twilioRequest("call", twilioCall({ sid: stableSid("CA", "spam_call"), from: "+13125550155",
-      CallStatus: "completed", CallDuration: "8" })),
+      ...answeredFields(8) })),
   },
   {
-    id: "answered_call", label: "Answered call, 2 minutes",
-    expected: "New job: \"New - call ... - what was it about?\".",
+    id: "answered_call", label: "Answered call, 2 minutes", note: "New job: what was it about?",
     build: () => twilioRequest("call", twilioCall({ sid: stableSid("CA", "answered_call"), from: "+13125550168",
-      CallStatus: "completed", CallDuration: "120" })),
+      ...answeredFields(120) })),
   },
 ];
 
-/** [{id, label, route, expected}] for the simulator screen. */
+/** [{id, label, note, route}] for the simulator screen (GET /api/sim/presets). */
 export const PRESETS = Object.freeze(
-  DEFINITIONS.map(({ id, label, expected, build }) => Object.freeze({ id, label, expected, route: build({}).route })),
+  DEFINITIONS.map(({ id, label, note, build }) => Object.freeze({ id, label, note, route: build({}).route })),
 );
 
 /**
@@ -140,9 +132,7 @@ function customCall({ from, body, call_status: status = "missed", duration_s: du
   }
   const sid = freshSid("CA");
   if (status === "voicemail") return twilioRequest("call", twilioCall({ sid, from, ...voicemailFields(sid, body || "") }));
-  if (status === "answered") {
-    return twilioRequest("call", twilioCall({ sid, from, CallStatus: "completed", CallDuration: String(duration ?? 60) }));
-  }
+  if (status === "answered") return twilioRequest("call", twilioCall({ sid, from, ...answeredFields(duration ?? 60) }));
   return twilioRequest("call", twilioCall({ sid, from, CallStatus: "no-answer", CallDuration: "0" }));
 }
 
@@ -151,7 +141,7 @@ function customEmail({ from, body, format }) {
   if (format === "generic") return jsonRequest("email", { from, text: body, subject: "Message", message_id: messageId });
   if (format === "raw") {
     const raw = [`From: ${from}`, "Subject: Message", `Message-ID: ${messageId}`, "", body].join("\n");
-    return { route: "email", path: ROUTE_PATHS.email, contentType: "text/plain", body: raw };
+    return { route: "email", path: INBOUND_PATHS.email, contentType: "text/plain", body: raw };
   }
   const address = /@/.test(from ?? "") ? { Email: from, Name: "" } : FORM_SENDER;
   return jsonRequest("email", postmarkEmail({ messageId, from: address, subject: "Message", text: body }));

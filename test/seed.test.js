@@ -11,14 +11,14 @@ import { fileURLToPath } from "node:url";
 import { openDb, all, get } from "../server/db.js";
 import * as repo from "../server/repo.js";
 import * as clock from "../server/clock.js";
-import { seedDemo, defaultAnchor } from "../server/seed.js";
+import { seedDemo } from "../server/seed.js";
 import { createApp } from "../server/app.js";
 import { seedJobViews, SEED_ANCHOR } from "./fixtures/seed-state.js";
-import { mostRecentMonday0700 } from "../shared/time.js";
+import { messagesOf } from "./fixtures/history.js";
 
 process.env.AI_PARSING = "off";
 const A = SEED_ANCHOR; // Mon 2026-10-05 07:00 America/Chicago
-const ROOT = fileURLToPath(new URL("..", import.meta.url));
+const SEED_CLI = fileURLToPath(new URL("../server/seed.js", import.meta.url));
 const servers = [];
 after(() => {
   for (const s of servers) s.close();
@@ -46,14 +46,14 @@ async function serve(db, now = () => A) {
 
 const EXPECTED_ROWS = [
   [1, "Bella Cucina", ["URGENT"], "Walk-in freezer at 28 degrees and climbing - voicemail Fri 4:47pm, nobody's called back", "Not contacted - 2d 14h (red)"],
-  [2, "Harbor Grill", [], "Texted yesterday 6:05pm: \"Can Mike come Wednesday instead of Tuesday? We're closed…\"", "12h (grey)"],
+  [2, "Harbor Grill", [], "Texted yesterday 6:05pm: \"Can Mike come Wednesday instead of Tuesday? We're closed…\"", "Waiting 12h (grey)"],
   [3, "(312) 555-0177", [], "New - missed call Sat 1:12pm - no voicemail", "Not contacted - 1d 17h (amber)"],
   [4, "Fresh Mart #2", [], "New - web form today 6:02am - Deli ice machine making half the ice", "Not contacted - 58m (grey)"],
-  [5, "Joe's Diner", ["Repeat - 1 past job"], "Said yes Fri - not scheduled yet - hasn't heard from us in 3 days", "2d 17h (red)"],
-  [6, "Midway Meats", [], "Waiting on your quote since Wed - hasn't heard from us in 5 days", "4d 20h (red)"],
-  [7, "Hillside Grocery", [], "Waiting on your quote since Thu - hasn't heard from us in 4 days", "3d 20h (red)"],
-  [8, "Lakeview Brewing Co.", [], "Waiting on your quote since Fri - hasn't heard from us in 3 days", "2d 21h (red)"],
-  [9, "Rosa's Taqueria", ["Repeat - 1 past job"], "Quote sent Thu, $2,400 - no answer in 4 days", "3d 16h (amber)"],
+  [5, "Joe's Diner", ["Repeat - 1 past job"], "Said yes Fri - not scheduled yet - hasn't heard from us in 3 days", "Waiting 2d 17h (red)"],
+  [6, "Midway Meats", [], "Waiting on your quote since Wed - hasn't heard from us in 5 days", "Waiting 4d 20h (red)"],
+  [7, "Hillside Grocery", [], "Waiting on your quote since Thu - hasn't heard from us in 4 days", "Waiting 3d 20h (red)"],
+  [8, "Lakeview Brewing Co.", [], "Waiting on your quote since Fri - hasn't heard from us in 3 days", "Waiting 2d 21h (red)"],
+  [9, "Rosa's Taqueria", ["Repeat - 1 past job"], "Quote sent Thu, $2,400 - no answer in 4 days", "Waiting 3d 16h (amber)"],
   [10, "Sal's Pizza", [], "Luis went Fri - done?", null],
 ];
 
@@ -91,9 +91,11 @@ test("T04 seed: GET /api/today at A equals §12.3 exactly", async () => {
   assert.deepEqual(today.stage_counts, { new: 3, quote: 3, waiting_yes: 2, to_schedule: 2, scheduled: 3 });
   assert.equal(today.open_count, 13);
   assert.deepEqual(today.footer, {
-    scheduled_today: 1, snoozed: 1, text: "Scheduled today: 1 · Snoozed: 1",
+    scheduled_today: 1, snoozed: 1, text: "Scheduled today: 1 · Put off till later: 1",
     last24h_text: "Last 24 hours: 1 came in, 1 not called yet",
   });
+  assert.equal(today.empty, null);
+  assert.equal(today.texts_failing, false);
   assert.deepEqual(today.demo, { shifted: true, label: "Demo time: Mon Oct 5, 7:00am" });
 });
 
@@ -191,15 +193,14 @@ test("job 8's Sunday text is attached as an unread reply; job 9 is snoozed to We
   assert.equal(harbor.stage, "scheduled");
   assert.equal(harbor.visit_date, "2026-10-06");
   assert.equal(harbor.unread_inbound_at, "2026-10-04T23:05:00.000Z");
-  assert.equal(repo.messagesForJob(db, 8).length, 2);
-  assert.equal(get(db, "SELECT summary FROM events WHERE job_id = 8 AND kind = 'inbound'").summary,
-    "Texted: Can Mike come Wednesday instead of Tuesday? We're closed Tuesdays.");
+  assert.equal(messagesOf(db, 8).length, 2);
+  assert.equal(get(db, "SELECT summary FROM events WHERE job_id = 8 AND kind = 'inbound'").summary, "Texted back");
   const maple = repo.getJobRow(db, 9);
   assert.equal(maple.stage, "to_schedule");
   assert.equal(maple.snoozed_until, "2026-10-07T05:00:00.000Z");
   assert.deepEqual(all(db, "SELECT summary FROM events WHERE job_id = 9 AND kind = 'outcome' ORDER BY id").map((r) => r.summary),
-    ["Quote sent - $780", "Said yes - needs scheduling", "Snoozed until Wed"]);
-  const prev = repo.parseEventRow(get(db, "SELECT * FROM events WHERE job_id = 9 AND summary = 'Snoozed until Wed'")).prev;
+    ["Quote sent - $780", "Said yes - needs scheduling", "Put off until Wed"]);
+  const prev = repo.getEvent(db, get(db, "SELECT id FROM events WHERE job_id = 9 AND summary = 'Put off until Wed'").id).prev;
   assert.equal(prev.stage, "to_schedule");
   assert.equal(prev.snoozed_until, null);
 });
@@ -250,22 +251,20 @@ test("the seed is relative to its anchor: another Monday gives the same list", a
   assert.equal(get(db, "SELECT count(*) AS n FROM outbox").n, 6);
 });
 
-test("defaultAnchor is the most recent Monday 07:00 at or before the real time", () => {
-  const tz = "America/Chicago";
-  assert.equal(defaultAnchor(tz), mostRecentMonday0700(new Date().toISOString(), tz));
-});
-
 test("CLI: node server/seed.js --reset wipes and reseeds; without --reset it refuses a seeded DB", () => {
+  // Run from an empty folder, so a developer's .env can't change the result; no .env is no warning.
   const dir = mkdtempSync(join(tmpdir(), "callback-seed-"));
   try {
     const env = { PATH: process.env.PATH, DB_PATH: join(dir, "demo.db"), AI_PARSING: "off" };
-    const first = spawnSync(process.execPath, ["server/seed.js", "--reset"], { cwd: ROOT, env, encoding: "utf8" });
+    const seed = (args) => spawnSync(process.execPath, [SEED_CLI, ...args], { cwd: dir, env, encoding: "utf8" });
+    const first = seed(["--reset"]);
     assert.equal(first.status, 0, first.stderr);
+    assert.equal(first.stderr, "");
     assert.match(first.stdout, /^Seeded the demo: 18 jobs, 6 texts in the outbox\. Demo clock: Mon [A-Z][a-z]{2} \d{1,2} 7:00am\.\n$/);
-    const again = spawnSync(process.execPath, ["server/seed.js"], { cwd: ROOT, env, encoding: "utf8" });
+    const again = seed([]);
     assert.equal(again.status, 1);
     assert.match(again.stderr, /already has jobs/);
-    const reset = spawnSync(process.execPath, ["server/seed.js", "--reset"], { cwd: ROOT, env, encoding: "utf8" });
+    const reset = seed(["--reset"]);
     assert.equal(reset.status, 0, reset.stderr);
     const db = openDb(env.DB_PATH);
     assert.equal(get(db, "SELECT count(*) AS n FROM jobs").n, 18);

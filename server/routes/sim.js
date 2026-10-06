@@ -1,20 +1,21 @@
 // Demo controls (SPEC §9 "Demo controls", §12.6, §13.5): mounted under /api only when DEMO is on.
 // Inbound presets go through the real adapters and ingest(); every clock change runs the scheduler
-// once at the new time (skipped-over texts are not backfilled) and persists the offset.
+// once at the new time (skipped-over texts are not backfilled) and persists the offset. Moving the
+// clock back forgets the texts sent "in the future", so they can't block that day's real ones.
 import express from "express";
-import { wipe } from "../db.js";
+import { tx, wipe } from "../db.js";
 import * as repo from "../repo.js";
 import { ingestPayload } from "./inbound.js";
 import { buildPreset, buildCustom, PRESETS } from "../presets.js";
 import { tick } from "../scheduler.js";
 import { seedDemo } from "../seed.js";
-import { ApiError, contextFor, serializeOutbox } from "./api.js";
+import { invalid } from "../actions.js";
+import { contextFor, serializeOutbox } from "../context.js";
 import { addDays, addMinutes, atLocal, localDate, localHM, weekdayOf } from "../../shared/time.js";
 
 const CHANNELS = ["sms", "call", "email", "form"];
 const FORMATS = ["twilio", "postmark", "generic", "raw"];
 const CALL_STATUSES = ["missed", "voicemail", "answered"];
-const invalid = (message) => new ApiError(400, "validation", message);
 
 /** The first local `weekday` at `hm` strictly after now (DST-safe). */
 function nextLocal(now, tz, weekday, hm) {
@@ -61,17 +62,30 @@ function presetRequest(name, settings) {
   return buildPreset(name, { settings });
 }
 
+/** The clock went back to `now`: drop the texts dated after it, and their history lines. */
+function forgetTextsAfter(db, now) {
+  tx(db, () => {
+    repo.deleteEventsAfter(db, now, ["notified"]);
+    repo.deleteOutboxAfter(db, now);
+  });
+}
+
 /**
- * deps: {db, now: () => ISO, env, clock: {setNow, now}, fetch?, send?}
+ * deps: {db, now: () => ISO, env, publicUrl, clock: {setNow, now}, fetch?, send?}
  */
 export function simRouter(deps) {
-  const { db } = deps;
+  const { db, publicUrl } = deps;
   const router = express.Router();
+  const ctxAt = (now) => contextFor(db, now, { publicUrl });
   const runTick = async (now) => {
-    const { sent, delivered } = tick(db, now, { env: deps.env, fetch: deps.fetch });
+    const { sent, delivered } = tick(db, now, { env: deps.env, fetch: deps.fetch, publicUrl });
     const final = await delivered;
     return final.map((row, i) => row ?? sent[i]);
   };
+
+  router.get("/sim/presets", (req, res) => {
+    res.json({ items: PRESETS.map(({ id, label, note }) => ({ id, label, note })) });
+  });
 
   router.post("/sim/inbound", (req, res) => {
     const body = req.body ?? {};
@@ -79,31 +93,32 @@ export function simRouter(deps) {
     const request = body.preset != null ? presetRequest(body.preset, settings) : customRequest(body);
     const { result } = ingestPayload(request.route, request.body, {
       db, now: deps.now, settings: () => settings, send: deps.send, demo: true,
-    }, deps.env);
+    });
     const { refine, ...json } = result;
     res.json(json);
   });
 
   router.post("/sim/clock", async (req, res) => {
-    const before = contextFor(db, deps.now(), deps.env);
+    const before = ctxAt(deps.now());
     const target = clockTarget(req.body ?? {}, before.now, before.tz);
     deps.clock.setNow(target);
     const offset = target == null ? 0 : deps.clock.now().getTime() - Date.now();
     repo.putSettings(db, { clock_offset_ms: offset });
     const now = deps.now();
+    if (Date.parse(now) < Date.parse(before.now)) forgetTextsAfter(db, now);
     const sent = await runTick(now);
-    res.json({ now, offset_ms: offset, sent: serializeOutbox(sent, contextFor(db, now, deps.env)) });
+    res.json({ now, offset_ms: offset, sent: serializeOutbox(sent, ctxAt(now)) });
   });
 
   router.post("/sim/tick", async (req, res) => {
     const now = deps.now();
     const sent = await runTick(now);
-    res.json({ sent: serializeOutbox(sent, contextFor(db, now, deps.env)) });
+    res.json({ sent: serializeOutbox(sent, ctxAt(now)) });
   });
 
   router.post("/sim/reset", (req, res) => {
     wipe(db);
-    seedDemo(db, { env: deps.env });
+    seedDemo(db, { env: deps.env, publicUrl });
     res.json({ now: deps.now() });
   });
 

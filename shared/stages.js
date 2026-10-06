@@ -2,10 +2,10 @@
 // nothing reads the system clock, and no input object is ever mutated.
 
 import {
-  localDate, isYmd, nextBusinessDay, addBusinessDays, startOfDay, addMinutes, daysBetween,
-  dayLabel, whenLabel, weekdayName,
+  localDate, isYmd, nextBusinessDay, addBusinessDays, startOfDay, addMinutes, addDays, daysBetween,
+  dayLabel, whenLabel, weekdayName, weekdayOf,
 } from "./time.js";
-import { money } from "./format.js";
+import { money, shorten } from "./format.js";
 
 export const STAGES = Object.freeze([
   { id: "new", label: "New - call them back", short: "New", open: true },
@@ -30,7 +30,7 @@ export const LOST_REASONS = Object.freeze([
   { id: "not_a_job", label: "Not a real job" },
 ]);
 
-/** Same ids as server/ai.js. "other" is shown as no chip. */
+/** The equipment ids (server/ai.js builds its schema from them). "other" is shown as no chip. */
 export const EQUIPMENT = Object.freeze([
   { id: "walk_in_cooler", label: "Walk-in cooler" },
   { id: "walk_in_freezer", label: "Walk-in freezer" },
@@ -82,11 +82,18 @@ const QUIET_ROW = ["snooze", "lost"];
 const PROMOTIONS = {
   mark_yes: { outcome: "yes", label: "Mark as yes?" },
   mark_lost: { outcome: "lost", label: "Mark lost?" },
+  move_day: { outcome: "scheduled" }, // label and preset come from the day the reply asks for
   not_a_job: { outcome: "not_a_job", label: "Not a job?" },
   mark_lost_tries: { outcome: "lost", label: "Mark lost", preset: { lost_reason: "no_response" } },
 };
+/** The promotions that come from a customer's unread reply (today-rules replySuggestion). */
+const REPLY_SUGGESTIONS = ["mark_yes", "mark_lost", "move_day"];
 
 const SOMEONE_ELSE = /\b(went with (someone|somebody|another)|found (someone|somebody|another)|(someone|somebody) else|another (company|guy|tech|shop|outfit))\b/i;
+const WEEKDAY_WORDS = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
+const WEEKDAY_RE = /\b(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/gi;
+/** Words just before a weekday that rule it out: "instead of Tuesday", "closed Tuesday". */
+const NOT_THAT_DAY = /\b(instead of|not|closed|except|can'?t do|cannot do|busy)\s+(on\s+)?$/i;
 
 export class OutcomeError extends Error {
   /** @param {"invalid_outcome"|"missing_arg"} code */
@@ -127,8 +134,9 @@ export function lostReasonLabel(id) {
 
 /** Per-stage entry fields. `args`: amount, quote_sent_at, visit_date, tech, lost_reason, import. */
 const ENTRY = {
-  new: (job, { now }) => ({ next_due_at: now }),
+  new: (job, { now }) => ({ visit_date: null, next_due_at: now }),
   quote: (job, { now, tz }, args) => ({
+    visit_date: null,
     next_due_at: args.import ? now
       : job.urgent ? addMinutes(now, 120)
       : startOfDay(nextBusinessDay(localDate(now, tz)), tz),
@@ -136,6 +144,7 @@ const ENTRY = {
   waiting_yes: (job, { now, tz }, args) => {
     const sentAt = args.quote_sent_at ?? now;
     return {
+      visit_date: null,
       quote_sent_at: sentAt,
       quote_amount: args.amount ?? job.quote_amount ?? null,
       nudges: 0,
@@ -152,13 +161,14 @@ const ENTRY = {
       next_due_at: startOfDay(nextBusinessDay(visitDate), tz),
     };
   },
+  // A closed job moved to the other closed stage drops the fields of the one it leaves.
   done: (job, { now }, args) => ({
-    done_at: now, closed_at: now, won_at: job.won_at ?? now,
+    done_at: now, closed_at: now, won_at: job.won_at ?? now, lost_at: null, lost_reason: null,
     quote_amount: args.amount ?? job.quote_amount ?? null,
     next_due_at: null,
   }),
   lost: (job, { now }, args) => ({
-    lost_at: now, closed_at: now, lost_reason: args.lost_reason ?? null, next_due_at: null,
+    lost_at: now, closed_at: now, lost_reason: args.lost_reason ?? null, done_at: null, next_due_at: null,
   }),
 };
 
@@ -189,11 +199,6 @@ function offeredIds(job) {
   return new Set(job.unread_inbound_at ? ids : ids.filter((id) => id !== "seen"));
 }
 
-/** Ids of the outcomes `applyOutcome` accepts for this job right now. */
-export function offeredOutcomes(job) {
-  return [...offeredIds(job)];
-}
-
 function triedThreeTimes(job) {
   return (job.stage === "new" && (job.attempts ?? 0) >= 3)
     || (job.stage === "waiting_yes" && (job.nudges ?? 0) >= 3);
@@ -201,12 +206,11 @@ function triedThreeTimes(job) {
 
 /**
  * The single promotion that applies (§5.3 priority): a reply suggestion ("mark_yes" /
- * "mark_lost", from replySuggestion), then AI "Not a job?", then 3+ failed tries.
+ * "mark_lost" / "move_day", from replySuggestion), then AI "Not a job?", then 3+ failed tries.
  */
 export function promotionFor(job, replySuggestion = null) {
   const offered = offeredIds(job);
-  if (replySuggestion === "mark_yes" && offered.has("yes")) return "mark_yes";
-  if (replySuggestion === "mark_lost" && offered.has("lost")) return "mark_lost";
+  if (REPLY_SUGGESTIONS.includes(replySuggestion) && offered.has(PROMOTIONS[replySuggestion].outcome)) return replySuggestion;
   if (job.stage === "new" && job.ai_not_service) return "not_a_job";
   if (triedThreeTimes(job)) return "mark_lost_tries";
   return null;
@@ -223,14 +227,35 @@ function mainButtonIds(job, now, tz) {
   return upcoming ? MAIN_BUTTONS.scheduled_upcoming : MAIN_BUTTONS.scheduled_past;
 }
 
-function promotedButton(job, promotion) {
+function promotedButton(job, promotion, { now, tz }) {
   const { outcome, label, preset } = PROMOTIONS[promotion];
   const btn = { id: outcome, label, primary: true, suggested: true, needs: OUTCOME_BY_ID[outcome].needs };
   if (preset) btn.preset = { ...preset };
-  if (promotion === "mark_lost" && SOMEONE_ELSE.test(job.last_inbound?.body ?? "")) {
-    btn.preset = { lost_reason: "went_elsewhere" };
+  const reply = job.last_inbound?.body ?? "";
+  if (promotion === "mark_lost" && SOMEONE_ELSE.test(reply)) btn.preset = { lost_reason: "went_elsewhere" };
+  if (promotion === "move_day") {
+    const day = askedForDay(reply, now, tz);
+    btn.label = `Move to ${weekdayName(day, { long: true })}?`;
+    btn.preset = { visit_date: day };
   }
   return btn;
+}
+
+/** The weekday a reply asks for ("Can Mike come Wednesday instead of Tuesday?" -> 3), or null. */
+function askedWeekday(text) {
+  for (const match of text.matchAll(WEEKDAY_RE)) {
+    if (!NOT_THAT_DAY.test(text.slice(0, match.index))) return WEEKDAY_WORDS.indexOf(match[1].toLowerCase());
+  }
+  return null;
+}
+
+/** The first date after today on the weekday a customer's reply asks for, or null when it names none. */
+export function askedForDay(text, now, tz) {
+  const weekday = askedWeekday(String(text ?? ""));
+  if (weekday == null) return null;
+  let day = addDays(localDate(now, tz), 1);
+  while (weekdayOf(day) !== weekday) day = addDays(day, 1);
+  return day;
 }
 
 /**
@@ -251,7 +276,7 @@ export function outcomesFor(jobView, { suggestion = null, now = null, tz = null 
   if (done && jobView.quote_amount != null) done.preset = { amount: jobView.quote_amount };
   const promotion = promotionFor(jobView, suggestion);
   if (promotion) {
-    const promoted = promotedButton(jobView, promotion);
+    const promoted = promotedButton(jobView, promotion, { now, tz });
     buttons = [promoted, ...buttons.filter((b) => b.id !== promoted.id)];
   }
   return buttons;
@@ -294,7 +319,28 @@ function eventDay(ymd, now, tz) {
 const withTech = (tech) => (tech ? ` with ${tech}` : "");
 const lowerFirst = (s) => s.charAt(0).toLowerCase() + s.slice(1);
 
-/** Each handler returns { patch, summary, toast(patch), args } for one outcome. */
+/**
+ * "Needs a quote for more work" on a visit: the visit is done at its own amount, and the extra
+ * work becomes a new job for the same customer, waiting on her quote (`spawn`).
+ */
+function moreWork(job, ctx) {
+  const { now, tz } = ctx;
+  const problem = job.problem ? shorten(`More work: ${job.problem}`, 60) : "More work";
+  return {
+    patch: enterStage(job, "done", ctx), args: {},
+    summary: "Done - needs a quote for more work",
+    toast: () => "Marked done. The extra work is a new job waiting on your quote.",
+    spawn: {
+      job: {
+        customer_id: job.customer_id, source: "manual", problem, equipment: job.equipment ?? null,
+        parsed_by: "manual", created_at: now, ...enterStage({ stage: "new" }, "quote", ctx),
+      },
+      event: { kind: "created", summary: `Extra work found at the ${eventDay(job.visit_date, now, tz)} visit` },
+    },
+  };
+}
+
+/** Each handler returns { patch, summary, toast(patch), args } for one outcome (plus customerPatch / spawn). */
 const HANDLERS = {
   no_answer(job, args, { now, tz }) {
     const attempts = (job.attempts ?? 0) + 1;
@@ -310,6 +356,7 @@ const HANDLERS = {
   },
 
   need_quote(job, args, ctx) {
+    if (job.stage === "scheduled") return moreWork(job, ctx);
     return {
       patch: enterStage(job, "quote", ctx), args: {},
       summary: "Talked - needs a quote",
@@ -394,8 +441,8 @@ const HANDLERS = {
     return {
       patch: { snoozed_until: until, next_due_at: until, unread_inbound_at: null },
       args: { snooze_until: day },
-      summary: `Snoozed until ${eventDay(day, now, tz)}`,
-      toast: (p) => `Snoozed. Back on your list ${whenLabel(p.next_due_at, now, tz)}.`,
+      summary: `Put off until ${eventDay(day, now, tz)}`,
+      toast: (p) => `OK, it'll be back on your list ${whenLabel(p.next_due_at, now, tz)}.`,
     };
   },
 
@@ -431,8 +478,9 @@ const HANDLERS = {
 };
 
 /**
- * Apply one outcome tap. Returns { patch, event: {kind:"outcome", summary, data}, toast }
- * (plus `customer_patch: {blocked: 1}` for "Not a job" with `block: true`).
+ * Apply one outcome tap. Returns { patch, event: {kind:"outcome", summary, data}, toast }, plus
+ * `customer_patch: {blocked: 1}` for "Not a job" with `block: true`, and `spawn: {job, event}` (the
+ * new job's row and its "created" event) for "Needs a quote for more work".
  * Throws OutcomeError("invalid_outcome") when the outcome is not offered for this job,
  * and OutcomeError("missing_arg") when a required picker value is missing or invalid.
  */
@@ -462,6 +510,7 @@ export function applyOutcome(jobView, outcomeId, args, ctx) {
     toast: result.toast(patch),
   };
   if (result.customerPatch) out.customer_patch = result.customerPatch;
+  if (result.spawn) out.spawn = result.spawn;
   return out;
 }
 

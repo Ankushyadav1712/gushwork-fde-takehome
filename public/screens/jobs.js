@@ -1,18 +1,23 @@
 // Jobs (#/jobs?stage=): where every job is at, grouped by her stages, with search (§9).
 import { html, useState, useEffect } from "/vendor/preact-htm.js";
 import * as api from "../api.js";
-import { useApp, useAsync, ErrorState, Loading, PageHeader, plural } from "../ui/common.js";
-import { STAGES, OPEN_STAGES, stageShort } from "../ui/constants.js";
-import { JobRow } from "../ui/job-info.js";
+import { pluralWord } from "/shared/format.js";
+import { STAGES, OPEN_STAGES, stageShort } from "/shared/stages.js";
+import { useApp, useAsync, ErrorState, Loading, PageHeader } from "../ui/common.js";
+import { JobRow, isPutOff } from "../ui/job-info.js";
 import { Icon } from "../ui/icons.js";
 
 const SEARCH_DEBOUNCE_MS = 250;
 
+// "later" (put off till later) is filtered here from the open list; the others are server filters.
+const PUT_OFF = "later";
 const FILTERS = [
   { id: "open", label: "All open" },
   ...OPEN_STAGES.map((id) => ({ id, label: stageShort(id) })),
+  { id: PUT_OFF, label: "Put off till later" },
   { id: "closed", label: "Closed (last 30 days)" },
 ];
+const UNCOUNTED = [PUT_OFF, "closed"];
 
 function openTotal(counts) {
   if (!counts) return null;
@@ -41,7 +46,7 @@ function FilterChips({ active, counts }) {
       const isActive = active === f.id;
       return html`<a key=${f.id} href=${`#/jobs?stage=${f.id}`} class=${`filter-chip ${isActive ? "active" : ""}`}
         aria-current=${isActive ? "page" : null}>
-        <span>${f.label}</span>${typeof count === "number" && f.id !== "closed" && html` <span class="num chip-count">${count}</span>`}
+        <span>${f.label}</span>${typeof count === "number" && !UNCOUNTED.includes(f.id) && html` <span class="num chip-count">${count}</span>`}
       </a>`;
     })}
   </nav>`;
@@ -52,15 +57,16 @@ export function JobsScreen({ stage }) {
   const [q, setQ] = useState("");
   const query = useDebounced(q.trim(), SEARCH_DEBOUNCE_MS);
   const { data, error, loading, reload } = useAsync(async () => {
-    const res = await api.getJobs({ stage, q: query });
+    const putOff = stage === PUT_OFF;
+    const res = await api.getJobs({ stage: putOff ? "open" : stage, q: query });
     app.setServerNow(res?.now);
-    return res;
+    return putOff ? { ...res, jobs: res.jobs.filter((j) => isPutOff(j, res.now)) } : res;
   }, [stage, query]);
   useEffect(() => { if (app.version) reload({ quiet: true }); }, [app.version]);
 
   const total = openTotal(data?.counts);
   const now = data?.now || app.nowIso();
-  const grouped = stage === "open" || stage === "closed";
+  const grouped = ["open", "closed", PUT_OFF].includes(stage);
 
   const list = () => {
     if (!data) return error ? html`<${ErrorState} error=${error} onRetry=${reload} />` : html`<${Loading} />`;
@@ -77,7 +83,7 @@ export function JobsScreen({ stage }) {
   };
 
   return html`<div class="jobs">
-    <${PageHeader} title=${total == null ? "Jobs" : `${total} open ${plural(total, "job", "jobs")}`}>
+    <${PageHeader} title=${total == null ? "Jobs" : `${total} open ${pluralWord(total, "job", "jobs")}`}>
       ${app.demo && html`<a class="header-link" href="#/sim">Demo</a>`}
       <a class="header-link" href="#/numbers">Numbers</a>
       <a class="icon-btn" href="#/settings" aria-label="Settings"><${Icon} name="gear" /></a>

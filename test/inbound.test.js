@@ -1,19 +1,21 @@
-// Inbound HTTP routes (SPEC §7.2, §12.6): R01, R02, the guards (T21), and every demo preset.
+// Inbound HTTP routes (SPEC §7.2, §12.6, C1-C4): R01, R02, the guards (T21), every demo preset, and
+// the intake review fixes that need the whole route (relay senders, forwarded email, form layouts, calls).
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
 import express from "express";
 import { openDb, all, get } from "../server/db.js";
 import * as repo from "../server/repo.js";
-import { inboundRouter } from "../server/routes/inbound.js";
+import { inboundRouter, INBOUND_PATHS, webhookUrlWarning } from "../server/routes/inbound.js";
+import { resolvePublicUrl } from "../server/context.js";
 import { buildPreset, buildCustom, encodeBody, PRESETS } from "../server/presets.js";
 import { applyOutcome } from "../shared/stages.js";
-import { detectFormEmail, htmlToText, formExternalId, fromRawEmail, fromTwilioVoice } from "../server/adapters.js";
 import { cardFor } from "../shared/today-rules.js";
 import { replyIntent } from "../shared/parse.js";
 import { sourceLabel, titleFor } from "../shared/format.js";
 import { telLink } from "../shared/templates.js";
 import { atLocal } from "../shared/time.js";
+import { eventsOf } from "./fixtures/history.js";
 
 const TZ = "America/Chicago";
 const A = "2026-10-05T12:00:00.000Z"; // Mon Oct 5 2026 07:00 local
@@ -32,11 +34,13 @@ after(() => {
 });
 
 /** A fresh database behind an app with only the inbound router, listening on port 0. */
-async function startApp({ now = A, demo } = {}) {
+async function startApp({ now = A, demo, settings = {} } = {}) {
   const db = openDb(":memory:");
   repo.ensureSettings(db);
+  repo.putSettings(db, settings);
   const app = express();
-  app.use(inboundRouter({ db, now: () => now, settings: () => repo.getSettings(db), demo }));
+  const publicUrl = resolvePublicUrl(process.env);
+  app.use(inboundRouter({ db, now: () => now, settings: () => repo.getSettings(db), demo, publicUrl }));
   const server = await new Promise((resolve) => {
     const s = app.listen(0, "127.0.0.1", () => resolve(s));
   });
@@ -90,10 +94,10 @@ function jobShape(db, jobId) {
 // ---------------------------------------------------------------------------
 // R01: missed call
 
-test("R01: a missed call creates the same new job via the Twilio form, generic JSON and the alias", async () => {
+test("R01: a missed call creates the same new job via the Twilio form and generic JSON", async () => {
   const twilio = await startApp();
   const sim = buildCustom({ channel: "call", from: "(312) 555-0177", call_status: "missed" });
-  const res = await postRequest(twilio.base, sim, "/webhooks/twilio/voice");
+  const res = await postRequest(twilio.base, sim);
   assert.deepEqual([res.status, res.type.split(";")[0], res.text], [200, "text/xml", "<Response/>"]);
   const jobId = lastMessage(twilio.db).job_id;
   const shape = jobShape(twilio.db, jobId);
@@ -108,12 +112,20 @@ test("R01: a missed call creates the same new job via the Twilio form, generic J
     ["Missed call", "tel:+13125550177", "New - missed call today 7:00am - no voicemail", "(312) 555-0177"]);
   assert.equal(telLink("+13125550177"), "tel:+13125550177");
 
-  for (const path of ["/api/inbound/call", "/webhooks/voice"]) {
-    const generic = await startApp();
-    const r = await post(generic.base, path, json({ from: "(312) 555-0177", status: "missed", id: "call-1" }));
-    assert.deepEqual([r.status, r.json.status], [200, "created_job"]);
-    assert.deepEqual(jobShape(generic.db, r.json.job_id), shape);
+  const generic = await startApp();
+  const r = await post(generic.base, "/api/inbound/call", json({ from: "(312) 555-0177", status: "missed", id: "call-1" }));
+  assert.deepEqual([r.status, r.json.status], [200, "created_job"]);
+  assert.deepEqual(jobShape(generic.db, r.json.job_id), shape);
+});
+
+test("C1: exactly one path per channel; the old /webhooks/* aliases are gone", async () => {
+  assert.deepEqual(INBOUND_PATHS, { sms: "/api/inbound/sms", call: "/api/inbound/call", email: "/api/inbound/email", form: "/api/inbound/form" });
+  const { db, base } = await startApp();
+  for (const alias of ["/webhooks/twilio/sms", "/webhooks/sms", "/webhooks/twilio/voice", "/webhooks/voice",
+    "/webhooks/postmark", "/webhooks/mailgun", "/webhooks/email", "/webhooks/form"]) {
+    assert.equal((await post(base, alias, json({ from: "+13125550166", body: "walk-in down" }))).status, 404, alias);
   }
+  assert.equal(count(db, "messages"), 0);
 });
 
 // ---------------------------------------------------------------------------
@@ -164,7 +176,7 @@ const RAW_TONY = [
 test("R02: a raw pasted email (text/plain or message/rfc822) gives the same fields", async () => {
   for (const contentType of ["text/plain", "message/rfc822"]) {
     const { db, base } = await startApp();
-    const r = await post(base, "/webhooks/email", { contentType, body: RAW_TONY });
+    const r = await post(base, "/api/inbound/email", { contentType, body: RAW_TONY });
     assert.equal(r.json.status, "created_job");
     const { last_inbound: inbound, ...fields } = jobShape(db, r.json.job_id);
     assert.deepEqual(fields, TONY_FIELDS);
@@ -187,23 +199,37 @@ test("email: a plain customer email (generic JSON) stays channel 'email'; HTML i
   assert.deepEqual([jv.customer.email, jv.customer.contact_name, jv.equipment], ["ana@harborgrill.example", "Ana Ruiz", "reach_in"]);
 });
 
-test("email: Mailgun urlencoded, with the signature checked when MAILGUN_SIGNING_KEY is set", withEnv({ MAILGUN_SIGNING_KEY: "mg-key" }, async () => {
+/** Mailgun's signature fields for a token, timestamped `ageS` seconds before the real now. */
+function mailgunSigned(token, ageS = 0) {
+  const timestamp = String(Math.floor(Date.now() / 1000) - ageS);
+  return { timestamp, token, signature: createHmac("sha256", "mg-key").update(`${timestamp}${token}`).digest("hex") };
+}
+
+test("C2: with MAILGUN_SIGNING_KEY set, email needs a fresh, unused Mailgun signature", withEnv({ MAILGUN_SIGNING_KEY: "mg-key" }, async () => {
   const { db, base } = await startApp();
-  const payload = {
+  const payload = (id) => ({
     sender: "forms@frostline.example", from: "Frostline Website <forms@frostline.example>",
-    subject: "New website form submission", "Message-Id": "<mg-1@frostline.example>",
+    subject: "New website form submission", "Message-Id": `<${id}@frostline.example>`,
     "body-plain": "Name: Linda Park\nBusiness: Maple Street Bakery\nPhone: 312-555-0138\nMessage: Reach-in door hinge broke",
-    timestamp: "1791200000", token: "abc123",
+  });
+  const forbidden = async (body) => {
+    const r = await post(base, "/api/inbound/email", body);
+    assert.deepEqual([r.status, r.json.error.code], [403, "forbidden"]);
   };
-  const bad = await post(base, "/webhooks/mailgun", form({ ...payload, signature: "0".repeat(64) }));
-  assert.deepEqual([bad.status, bad.json.error.code], [403, "forbidden"]);
+  await forbidden(form({ ...payload("mg-0"), ...mailgunSigned("t0"), signature: "0".repeat(64) }));
+  await forbidden(form({ ...payload("mg-0"), ...mailgunSigned("t0", 10 * 60) })); // stale
+  await forbidden(json({ from: "ann@bistro.example", text: "Walk-in is warm", message_id: "g-1" })); // not signed at all
+  await forbidden({ contentType: "text/plain", body: "From: ann@bistro.example\nSubject: hi\n\nWalk-in is warm" });
   assert.equal(count(db, "messages"), 0);
-  const signature = createHmac("sha256", "mg-key").update("1791200000abc123").digest("hex");
-  const good = await post(base, "/webhooks/mailgun", form({ ...payload, signature }));
+
+  const signed = mailgunSigned("t1");
+  const good = await post(base, "/api/inbound/email", form({ ...payload("mg-1"), ...signed }));
   assert.deepEqual([good.status, good.json.status], [200, "created_job"]);
   const jv = repo.getJobView(db, good.json.job_id);
   assert.deepEqual([jv.source, jv.customer.business_name, jv.customer.phone], ["form", "Maple Street Bakery", "+13125550138"]);
   assert.equal(lastMessage(db).provider, "mailgun");
+  await forbidden(form({ ...payload("mg-2"), ...signed })); // the same token again is a replay
+  assert.equal(count(db, "messages"), 1);
 }));
 
 // ---------------------------------------------------------------------------
@@ -217,7 +243,7 @@ test("form webhook: aliases are mapped, unknown fields appended, and the submiss
     "How can we help?": "Deli ice machine is making about half the ice it used to.", "Best time": "mornings",
     submission_id: "sub-77",
   };
-  const r = await post(base, "/webhooks/form", json(payload));
+  const r = await post(base, "/api/inbound/form", json(payload));
   assert.equal(r.json.status, "created_job");
   const msg = lastMessage(db);
   assert.deepEqual([msg.channel, msg.provider, msg.external_id, msg.body],
@@ -237,7 +263,7 @@ test("form webhook: aliases are mapped, unknown fields appended, and the submiss
 
 test("sms: Twilio photos add '[photo attached]'; generic JSON answers JSON", async () => {
   const { db, base } = await startApp();
-  const twilio = await post(base, "/webhooks/sms", form({ MessageSid: "SMphoto", From: "+13125550166", Body: "look at this", NumMedia: "1" }));
+  const twilio = await post(base, "/api/inbound/sms", form({ MessageSid: "SMphoto", From: "+13125550166", Body: "look at this", NumMedia: "1" }));
   assert.deepEqual([twilio.status, twilio.text], [200, "<Response/>"]);
   assert.equal(lastMessage(db).body, "look at this\n[photo attached]");
   const generic = await post(base, "/api/inbound/sms", json({ from: "312-555-0167", body: "walk-in down", id: "g1" }));
@@ -256,20 +282,13 @@ test("generic 'at' is honoured only in demo mode", async () => {
   assert.equal(repo.getMessage(demo.db, r2.json.message_id).received_at, earlier);
 });
 
-test("generic 'at' follows DEMO=1 when no demo flag is passed", withEnv({ DEMO: "1" }, async () => {
-  const earlier = "2026-10-03T18:12:00.000Z";
-  const { db, base } = await startApp();
-  const r = await post(base, "/api/inbound/sms", json({ from: "+13125550177", body: "hi", at: earlier }));
-  assert.equal(repo.getJobRow(db, r.json.job_id).created_at, earlier);
-}));
-
 // ---------------------------------------------------------------------------
 // Guards (T21)
 
 test("T21: with INBOUND_TOKEN set, a missing or wrong token gets 401 and writes nothing", withEnv({ INBOUND_TOKEN: "s3cret" }, async () => {
   const { db, base } = await startApp();
   const body = json({ from: "+13125550166", body: "walk-in down" });
-  for (const path of ["/api/inbound/sms", "/api/inbound/sms?token=nope", "/webhooks/sms?token=s3cret2"]) {
+  for (const path of ["/api/inbound/sms", "/api/inbound/sms?token=nope", "/api/inbound/form?token=s3cret2"]) {
     const r = await post(base, path, body);
     assert.deepEqual([r.status, r.json], [401, { error: { code: "unauthorized", message: "Missing or wrong token." } }]);
   }
@@ -289,12 +308,12 @@ test("T21: with TWILIO_AUTH_TOKEN set, a bad signature gets 403 and a correct on
   async () => {
     const { db, base } = await startApp();
     const params = { MessageSid: "SMsig", From: "+13125550166", To: "+13125550105", Body: "freezer down", NumMedia: "0" };
-    const path = "/webhooks/twilio/sms?token=s3cret";
+    const path = "/api/inbound/sms?token=s3cret";
     const none = await post(base, path, form(params));
     assert.deepEqual([none.status, none.json.error.code], [403, "forbidden"]);
     const wrong = await post(base, path, { ...form(params), headers: { "X-Twilio-Signature": "bm9wZQ==" } });
     assert.equal(wrong.status, 403);
-    const forOtherUrl = expectedTwilioSignature("twilio-secret", "https://callback.example/webhooks/sms?token=s3cret", params);
+    const forOtherUrl = expectedTwilioSignature("twilio-secret", "https://callback.example/api/inbound/call?token=s3cret", params);
     assert.equal((await post(base, path, { ...form(params), headers: { "X-Twilio-Signature": forOtherUrl } })).status, 403);
     assert.equal(count(db, "messages"), 0);
 
@@ -305,13 +324,63 @@ test("T21: with TWILIO_AUTH_TOKEN set, a bad signature gets 403 and a correct on
   },
 ));
 
-test("bodies over 1 MB get 413; an empty body gets 400", async () => {
+test("C2: with TWILIO_AUTH_TOKEN set, sms and call need a signature whatever the payload shape (security RT-2)", withEnv(
+  { TWILIO_AUTH_TOKEN: "twilio-secret", PUBLIC_URL: "https://callback.example" },
+  async () => {
+    const { db, base } = await startApp();
+    const generic = {
+      "/api/inbound/sms": { from: "+13125550402", body: "Walk-in freezer down at Fake Grill" },
+      "/api/inbound/call": { from: "+13125550404", status: "voicemail", voicemail_text: "freezer down" },
+    };
+    for (const [path, body] of Object.entries(generic)) {
+      assert.equal((await post(base, path, json(body))).status, 403, path);
+      assert.equal((await post(base, path, form(body))).status, 403, path);
+    }
+    assert.equal(count(db, "messages"), 0);
+    for (const [path, body] of Object.entries(generic)) {
+      const signature = expectedTwilioSignature("twilio-secret", `https://callback.example${path}`, body);
+      const signed = await post(base, path, { ...json(body), headers: { "X-Twilio-Signature": signature } });
+      assert.deepEqual([signed.status, signed.json.status], [200, "created_job"], path);
+    }
+    // Email and form are not Twilio's: the Twilio key alone doesn't guard them.
+    assert.equal((await post(base, "/api/inbound/form", json({ name: "Pat", phone: "3125550187", message: "Prep table warm" }))).status, 200);
+  },
+));
+
+test("C2: boot warns when signatures are on but PUBLIC_URL can't be the address providers post to", () => {
+  assert.equal(webhookUrlWarning({}), null);
+  assert.equal(webhookUrlWarning({ TWILIO_AUTH_TOKEN: "t", PUBLIC_URL: "https://callback.example" }), null);
+  assert.match(webhookUrlWarning({ TWILIO_AUTH_TOKEN: "t" }), /PUBLIC_URL is not set/);
+  assert.match(webhookUrlWarning({ MAILGUN_SIGNING_KEY: "k", PUBLIC_URL: "http://localhost:3000" }), /localhost/);
+  assert.match(webhookUrlWarning({ TWILIO_AUTH_TOKEN: "t", PUBLIC_URL: "http://127.0.0.1:4300/" }), /localhost/);
+});
+
+test("bodies over 1 MB get 413; an empty body gets 400; plain text to sms or call gets 415 (intake RT-6)", async () => {
   const { db, base } = await startApp();
   const big = await post(base, "/api/inbound/email", json({ from: "a@b.example", text: "x".repeat(1_100_000) }));
   assert.deepEqual([big.status, big.json.error.code], [413, "validation"]);
   const empty = await post(base, "/api/inbound/form", json({}));
   assert.equal(empty.status, 400);
+  for (const path of ["/api/inbound/sms", "/api/inbound/call"]) {
+    const text = await post(base, path, { contentType: "text/plain", body: "Freezer down at Joe's 312-555-7408" });
+    assert.deepEqual([text.status, text.json.error.code], [415, "validation"], path);
+    // curl's default content type turns a bare string into one empty field: nothing to call back.
+    const stray = await fetch(base + path, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: "Freezer down" });
+    assert.equal(stray.status, 400, path);
+  }
   assert.equal(count(db, "messages"), 0);
+  // The form route still reads plain text as the message.
+  const formText = await post(base, "/api/inbound/form", { contentType: "text/plain", body: "Freezer down at Joe's 312-555-7408" });
+  assert.equal(formText.json.status, "created_job");
+  assert.equal(repo.getJobView(db, formText.json.job_id).customer.phone, "+13125557408");
+});
+
+test("a 1 MB hostile HTML email is answered quickly instead of freezing the server (security RT-1)", async () => {
+  const { base } = await startApp();
+  const start = performance.now();
+  const r = await post(base, "/api/inbound/email", json({ from: "a@b.example", html: "<a".repeat(450_000), message_id: "redos-1" }));
+  assert.equal(r.status, 200);
+  assert.ok(performance.now() - start < 1000, "answered within a second");
 });
 
 // ---------------------------------------------------------------------------
@@ -358,6 +427,7 @@ test("every §12.6 preset through the router produces its expected result", asyn
   };
   assert.deepEqual(PRESETS.map((p) => p.id),
     ["rosa_yes", "lucia_repeat", "web_form_tony", "voicemail_carla", "forward_midway", "spam_call", "answered_call"]);
+  assert.ok(PRESETS.every((p) => typeof p.label === "string" && typeof p.note === "string" && p.note), "C11: every preset has a note");
 
   let { res, msg } = await send("rosa_yes");
   assert.deepEqual([res.text, msg.status, msg.job_id], ["<Response/>", "attached", jobs.rosa]);
@@ -414,24 +484,126 @@ test("buildCustom covers the simulator's other formats", async () => {
   assert.deepEqual(all(db, "SELECT DISTINCT status FROM messages"), [{ status: "created_job" }]);
 });
 
-test("adapters: form detection, HTML stripping, form hashes, raw emails and the call mapping", () => {
-  assert.equal(detectFormEmail("Thanks!\nPhone: 312-555-0142"), false);
-  assert.equal(detectFormEmail("Name: Tony Russo / Business: Tony's Bistro"), true);
-  assert.equal(detectFormEmail("name: Priya\nemail: p@x.example"), true);
-  assert.equal(htmlToText("<div>Walk-in&nbsp;down</div><br><b>Call</b> &#8217;asap&#x21;<script>x()</script>"), "Walk-in down\n\nCall \u2019asap!");
-  const hash = formExternalId({ body: "b", phone: "+13125550133", email: null }, "2026-10-05T11:02:00.000Z");
-  assert.equal(hash, formExternalId({ body: "b", phone: "+13125550133", email: null }, "2026-10-05T11:09:59.000Z"));
-  assert.notEqual(hash, formExternalId({ body: "b", phone: "+13125550133", email: null }, "2026-10-05T11:10:00.000Z"));
-  // A pasted form body without headers is never eaten as a header block.
-  const pasted = fromRawEmail("Name: Tony Russo\nPhone: (312) 555-0187\nMessage: Freezer warm");
-  assert.deepEqual([pasted.channel, pasted.body, pasted.external_id], ["form", "Name: Tony Russo\nPhone: (312) 555-0187\nMessage: Freezer warm", null]);
-  const mixed = fromRawEmail("Subject: freezer\nName: Tony Russo\nMessage: Freezer warm");
-  assert.deepEqual([mixed.subject, mixed.body], [null, "Subject: freezer\nName: Tony Russo\nMessage: Freezer warm"]);
-  const qp = fromRawEmail("From: a@b.example\nSubject: Hi\nContent-Transfer-Encoding: quoted-printable\n\nIt=E2=80=99s warm =\nnow");
-  assert.deepEqual([qp.channel, qp.body, qp.subject], ["email", "It\u2019s warm now", "Hi"]);
-  const call = (p) => fromTwilioVoice({ CallSid: "CA1", From: "+13125550177", ...p });
-  assert.deepEqual([call({ CallStatus: "busy" }).call_status, call({ DialCallStatus: "no-answer", CallStatus: "completed" }).call_status,
-    call({ CallStatus: "completed", DialCallStatus: "completed", DialCallDuration: "42", CallDuration: "50" }).call_duration_s,
-    call({ CallStatus: "queued" }).call_status, call({ RecordingUrl: "https://x" }).body],
-  ["missed", "missed", 42, null, "(voicemail - no transcript yet)"]);
+// ---------------------------------------------------------------------------
+// C4: who a lead is (intake RT-1, requirements RT-1)
+
+/** A Postmark inbound email. */
+function postmark({ id, from, name = "", subject = "New submission", text, html, headers = [] }) {
+  return json({
+    From: `${name} <${from}>`, FromFull: { Email: from, Name: name }, Subject: subject, MessageID: id,
+    TextBody: text ?? "", HtmlBody: html ?? "", Headers: [{ Name: "Message-ID", Value: `<${id}@x>` }, ...headers],
+  });
+}
+
+const customerOf = (db, jobId) => repo.getJobView(db, jobId).customer;
+
+test("form mailers: each submission is its own customer, and blocking spam never blocks the mailer (intake RT-1)", async () => {
+  const { db, base } = await startApp();
+  const wix = (id, name, phone, email, message) => postmark({ id, from: "no-reply@crm.wix.com", name: "Wix Forms",
+    text: `You have a new form submission.\n\nFull Name: ${name}\nPhone Number: ${phone}\nEmail: ${email}\nComments: ${message}\n` });
+  const carla = await post(base, "/api/inbound/email", wix("wix-1", "Carla Diaz", "(312) 555-7201", "carla@diaz.example", "Display case not cooling"));
+  const ben = await post(base, "/api/inbound/email", wix("wix-2", "Ben Ortiz", "(312) 555-7202", "ben@ortiz.example",
+    "Walk-in freezer down, losing product, need someone today"));
+  assert.deepEqual([carla.json.status, ben.json.status], ["created_job", "created_job"]);
+  assert.notEqual(carla.json.customer_id, ben.json.customer_id);
+  const benCustomer = customerOf(db, ben.json.job_id);
+  assert.deepEqual([benCustomer.contact_name, benCustomer.phone, benCustomer.email], ["Ben Ortiz", "+13125557202", "ben@ortiz.example"]);
+  assert.equal(repo.getJobRow(db, ben.json.job_id).urgent, 1);
+  assert.equal(get(db, "SELECT count(*) AS n FROM customers WHERE email = 'no-reply@crm.wix.com'").n, 0);
+
+  // WordPress HTML table: the cells give the name and problem. Blocking it blocks that sender only.
+  const wordpress = (id, rows) => postmark({ id, from: "wordpress@frostline.example", name: "WordPress",
+    html: `<table>${rows.map(([label, value]) => `<tr><td><b>${label}</b></td></tr><tr><td>${value}</td></tr>`).join("")}</table>` });
+  const spam = await post(base, "/api/inbound/email", wordpress("wp-1", [["Name", "SEO Guru"], ["Message", "We can rank your site #1 on Google"]]));
+  assert.deepEqual([customerOf(db, spam.json.job_id).contact_name, repo.getJobRow(db, spam.json.job_id).problem],
+    ["SEO Guru", "We can rank your site #1 on Google"]);
+  repo.updateCustomer(db, spam.json.customer_id, { blocked: 1 }, A);
+  const real = await post(base, "/api/inbound/email", wordpress("wp-2",
+    [["Name", "Rosa Alvarez"], ["Phone", "312-555-7299"], ["Message", "Walk-in freezer is down, losing product"]]));
+  assert.equal(real.json.status, "created_job");
+  assert.deepEqual([customerOf(db, real.json.job_id).contact_name, customerOf(db, real.json.job_id).phone], ["Rosa Alvarez", "+13125557299"]);
+});
+
+test("emails Denise forwards are known by the customer in them, not by her address (requirements RT-1)", async () => {
+  const { db, base } = await startApp({ settings: { owner_email: "denise@frostline.example" } });
+  const forward = (id, from, text, subject = "Fwd: service") => postmark({ id, from: "denise@frostline.example", name: "Denise Carter", subject,
+    text: `---------- Forwarded message ---------\nFrom: ${from}\nDate: Mon, Oct 5, 2026 at 6:30 AM\nSubject: service\nTo: <denise@frostline.example>\n\n${text}\n` });
+  const ann = await post(base, "/api/inbound/email", forward("f-1", "Ann Chef <ann@bistro.example>", "Our walk-in cooler is warm, call me 312-555-0181"));
+  const bob = await post(base, "/api/inbound/email", forward("f-2", "Bob Grocer <bob@grocer.example>", "Ice machine not making ice. 312-555-0182"));
+  assert.deepEqual([ann.json.status, bob.json.status], ["created_job", "created_job"]);
+  assert.deepEqual([customerOf(db, bob.json.job_id).contact_name, customerOf(db, bob.json.job_id).phone], ["Bob Grocer", "+13125550182"]);
+  assert.equal(get(db, "SELECT count(*) AS n FROM customers WHERE email IS NOT NULL").n, 0);
+
+  // Her own address is never identity, even without a forward marker.
+  const note = await post(base, "/api/inbound/email", postmark({ id: "f-3", from: "denise@frostline.example", subject: "note",
+    text: "Harbor Grill reach-in is warm, 312-555-0125" }));
+  assert.equal(customerOf(db, note.json.job_id).email, null);
+
+  // Forwarded form notifications whose inner sender is the form mailer: two leads, two jobs.
+  const formFwd = (id, business, phone, message) => forward(id, "Frostline Website <forms@frostline.example>",
+    `Name: ${business}\nPhone: ${phone}\nMessage: ${message}`, "Fwd: New form submission");
+  const doyle = await post(base, "/api/inbound/email", formFwd("f-4", "Doyle's Deli", "312-555-0131", "Walk-in is noisy"));
+  const lee = await post(base, "/api/inbound/email", formFwd("f-5", "Lee's Noodle Bar", "312-555-0132", "Ice machine leaking"));
+  assert.notEqual(doyle.json.customer_id, lee.json.customer_id);
+  assert.equal(lee.json.status, "created_job");
+});
+
+test("a real customer's own emails still find their open job (no regression)", async () => {
+  const { db, base } = await startApp();
+  const first = await post(base, "/api/inbound/email", postmark({ id: "a-1", from: "nora@lakeviewbrewing.example", name: "Nora Lindqvist",
+    subject: "Keg cooler", text: "Our keg cooler is warm." }));
+  const second = await post(base, "/api/inbound/email", postmark({ id: "a-2", from: "Nora@LakeviewBrewing.example", name: "Nora Lindqvist",
+    subject: "Re: Keg cooler", text: "Still warm this morning." }));
+  assert.deepEqual([second.json.status, second.json.job_id], ["attached", first.json.job_id]);
+  assert.equal(eventsOf(db, first.json.job_id)[0].summary, "Emailed back");
+});
+
+// ---------------------------------------------------------------------------
+// Website-form webhooks with real-world field names (intake RT-9, requirements RT-4)
+
+test("form webhooks: odd field names, bracket keys, nested data and split names become a callable job", async () => {
+  const { db, base } = await startApp();
+  const fox = await post(base, "/api/inbound/form", json({ "Your Name": "Mia Fox", "Company Name": "Fox Deli", "Phone #": "312.555.7304",
+    "E-mail": "mia@foxdeli.example", "What's going on?": "deli case is warm", form_id: "contact-7", utm_source: "google" }));
+  const ned = await post(base, "/api/inbound/form", form({ "fields[name]": "Ned", "fields[phone]": "3125557305",
+    "fields[message]": "walk in cooler leaking", entry_id: "e-55" }));
+  const oli = await post(base, "/api/inbound/form", json({ data: { name: "Oli", phone: "3125557306", message: "freezer warm" }, id: 991 }));
+  const jo = await post(base, "/api/inbound/form", json({ "First Name": "Jo", "Last Name": "King", Phone: "312-555-0143", Message: "reach-in not cooling" }));
+  const shape = (r) => {
+    const jv = repo.getJobView(db, r.json.job_id);
+    return [titleFor(jv), jv.customer.phone, jv.problem, jv.urgent];
+  };
+  assert.deepEqual(shape(fox), ["Fox Deli", "+13125557304", "Deli case is warm", 1]);
+  assert.deepEqual(shape(ned), ["Ned", "+13125557305", "Walk in cooler leaking", 1]);
+  assert.deepEqual(shape(oli), ["Oli", "+13125557306", "Freezer warm", 1]);
+  assert.deepEqual(shape(jo), ["Jo King", "+13125550143", "Reach-in not cooling", 1]);
+  assert.equal(repo.getMessage(db, fox.json.message_id).body, "deli case is warm");
+});
+
+// ---------------------------------------------------------------------------
+// Calls (C3: intake RT-3, RT-7)
+
+test("Phase 1 forwarded calls: a hang-up during the greeting is a missed call, not an answered one", async () => {
+  const { db, base } = await startApp();
+  const callback = (fields) => post(base, "/api/inbound/call", form({ AccountSid: "AC1", To: "+13125550105", ForwardedFrom: "+13125550100", ...fields }));
+  await callback({ CallSid: "CA_C", From: "+13125557003", CallStatus: "ringing" });
+  const completed = await callback({ CallSid: "CA_C", From: "+13125557003", CallStatus: "completed", CallDuration: "9" });
+  assert.equal(completed.text, "<Response/>");
+  const msg = lastMessage(db);
+  assert.deepEqual([msg.status, msg.external_id, msg.call_status, count(db, "messages")], ["created_job", "CA_C", "missed", 1]);
+  const card = cardFor(repo.getJobView(db, msg.job_id), { now: A, tz: TZ, settings: repo.getSettings(db) });
+  assert.equal(card.source_label, "Missed call");
+
+  await callback({ CallSid: "CA_D", From: "+13125557004", CallStatus: "completed", CallDuration: "25" });
+  assert.equal(repo.getJobRow(db, lastMessage(db).job_id).source_detail, "missed");
+});
+
+test("Phase 2: a short answered call stays ignored when the parent status callback follows", async () => {
+  const { db, base } = await startApp();
+  const callback = (fields) => post(base, "/api/inbound/call", form({ AccountSid: "AC1", To: "+13125550105", From: "+13125557006", ...fields }));
+  await callback({ CallSid: "CA_F", CallStatus: "in-progress", DialCallStatus: "completed", DialCallDuration: "8" });
+  await callback({ CallSid: "CA_F", CallStatus: "completed", CallDuration: "30" });
+  assert.deepEqual(all(db, "SELECT status, external_id, call_status, call_duration_s FROM messages"),
+    [{ status: "ignored", external_id: "CA_F", call_status: "answered", call_duration_s: 8 }]);
+  assert.equal(count(db, "jobs"), 0);
 });

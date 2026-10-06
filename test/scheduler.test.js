@@ -8,7 +8,8 @@ import * as clock from "../server/clock.js";
 import { tick, start } from "../server/scheduler.js";
 import { send, enqueue, smsMode, SENDING_NOTE } from "../server/notify.js";
 import { seedDemo } from "../server/seed.js";
-import { ingest, ingestManual } from "../server/ingest.js";
+import { outboxRow } from "./fixtures/history.js";
+import { ingest, ingestManual, ingestBulk } from "../server/ingest.js";
 import { isOnToday } from "../shared/today-rules.js";
 import { isOpen } from "../shared/stages.js";
 import { atLocal, addMinutes } from "../shared/time.js";
@@ -51,7 +52,7 @@ function twilioStub(response = { status: 201, body: { sid: "SM123" } }) {
 test("R20 the Mon 07:00 digest is in the outbox, simulated, when Twilio is not set", () => {
   const db = openDb(":memory:");
   seedDemo(db, { anchor: A, env: {} });
-  const digest = repo.outboxByDedupe(db, "digest:2026-10-05");
+  const digest = outboxRow(db, "digest:2026-10-05");
   assert.equal(digest.created_at, A);
   assert.equal(digest.status, "simulated");
   assert.equal(digest.to_phone, "+13125550100");
@@ -194,6 +195,58 @@ test("reminders: 2 hours for normal leads, never once touched, only 7am-9pm, not
   assert.deepEqual(morning.map((r) => r.kind), ["digest"], "the digest names it, so no reminder yet");
   assert.equal(tick(db, at("2026-10-07", "08:00"), SIMULATED).sent.length, 0, "within 60 minutes of the digest");
   assert.deepEqual(tick(db, at("2026-10-07", "08:01"), SIMULATED).sent.map((r) => r.job_id), [night]);
+});
+
+test("regression RT-1: Brain dump imports never get a 'Still not called back' text", () => {
+  const db = emptyDb();
+  const came = at("2026-10-05", "15:00");
+  const rows = ["Joe Diner ice machine making noise 312-555-0301", "Hilltop Market display case light out 312-555-0303",
+    "Bay Cafe walk-in freezer down 312-555-0304"].map((line) => ({ line, fields: { problem: line }, stage: "new" }));
+  const { created } = ingestBulk(db, rows, { now: came });
+  assert.equal(created.length, 3);
+  const lead = textIn(db, { from: "+13125550118", body: "Rosa here, can you clean the ice machine sometime", when: came });
+  const nags = (minutes) => tick(db, addMinutes(came, minutes), SIMULATED).sent.filter((r) => r.kind === "nag").map((r) => r.job_id);
+  assert.deepEqual(nags(30), []);
+  assert.deepEqual(nags(120), [lead], "a real lead still gets its one reminder");
+  assert.deepEqual(nags(180), []);
+  assert.equal(get(db, "SELECT count(*) AS n FROM outbox WHERE kind = 'nag'").n, 1);
+});
+
+test("regression CC-2: a text Twilio refuses isn't logged as sent, and a later tick tries again", async () => {
+  const db = emptyDb();
+  const came = at("2026-10-06", "10:00");
+  const jobId = textIn(db, { from: "+13125550142", body: "Walk-in freezer at 28 and climbing", when: came });
+  const notified = () => all(db, "SELECT summary FROM events WHERE job_id = ? AND kind = 'notified'", [jobId]);
+  const refused = twilioStub({ status: 401, body: { code: 20003, message: "Authenticate" } });
+
+  const first = tick(db, addMinutes(came, 30), { env: TWILIO_ENV, fetch: refused.fetch });
+  assert.equal((await first.delivered)[0].status, "failed");
+  assert.deepEqual(notified(), [], "nothing says 'Reminder texted to you'");
+
+  const ok = twilioStub();
+  const retry = tick(db, addMinutes(came, 31), { env: TWILIO_ENV, fetch: ok.fetch });
+  const [sent] = await retry.delivered;
+  assert.deepEqual([sent.kind, sent.status, sent.dedupe_key], ["nag", "sent", `nag:${jobId}#2`]);
+  assert.deepEqual(notified(), [{ summary: "Reminder texted to you" }]);
+  assert.equal(tick(db, addMinutes(came, 32), { env: TWILIO_ENV, fetch: ok.fetch }).sent.length, 0, "sent once is enough");
+  assert.deepEqual(outbox(db).map((r) => r.status), ["failed", "sent"], "the failed try stays in the outbox");
+});
+
+test("C10 a failing text is tried at most 3 times; a simulated one counts as sent at once", async () => {
+  const db = emptyDb();
+  const refused = twilioStub({ status: 500, body: {} });
+  for (let minute = 0; minute < 5; minute += 1) {
+    await tick(db, addMinutes(A, minute), { env: TWILIO_ENV, fetch: refused.fetch }).delivered;
+  }
+  assert.deepEqual(outbox(db).map((r) => [r.dedupe_key, r.status]), [
+    ["digest:2026-10-05", "failed"], ["digest:2026-10-05#2", "failed"], ["digest:2026-10-05#3", "failed"],
+  ]);
+  assert.equal(refused.calls.length, 3);
+
+  const simulated = emptyDb();
+  textIn(simulated, { from: "+13125550142", body: "Freezer is down", when: at("2026-10-05", "06:30") });
+  tick(simulated, A, SIMULATED);
+  assert.equal(get(simulated, "SELECT count(*) AS n FROM events WHERE kind = 'notified'").n, 1, "logged in the same tick");
 });
 
 test("scheduler.start runs once at once and then on its interval; stop() ends it", async () => {

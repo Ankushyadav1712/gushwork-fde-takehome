@@ -1,21 +1,25 @@
 // The Express app (SPEC §13.1, §13.5): inbound webhooks, body parsers, static files, the passcode
 // guard, the JSON API, the demo simulator (DEMO only), the husband's page, the SPA fallback and one
-// JSON error handler. createApp() has no side effects beyond the app it returns, so tests can run it.
+// JSON error handler. Besides the app it returns, createApp() only ever stores the session secret
+// (passcode on, no SESSION_SECRET), so tests can run it.
 import express from "express";
 import { fileURLToPath } from "node:url";
 import * as clock from "./clock.js";
 import * as repo from "./repo.js";
 import * as notify from "./notify.js";
+import { aiEnabled } from "./ai.js";
 import { createAuth } from "./auth.js";
+import { ApiError } from "./actions.js";
+import { resolvePublicUrl } from "./context.js";
 import { inboundRouter } from "./routes/inbound.js";
-import { apiRouter, aiOnFor, ApiError } from "./routes/api.js";
+import { apiRouter } from "./routes/api.js";
 import { simRouter } from "./routes/sim.js";
 import { numbersPageHandler } from "./numbers-page.js";
 
 const PUBLIC_DIR = fileURLToPath(new URL("../public/", import.meta.url));
 const SHARED_DIR = fileURLToPath(new URL("../shared/", import.meta.url));
 const LIMIT = "1mb";
-const NON_SPA_PREFIXES = ["/api/", "/webhooks/", "/n/", "/shared/"];
+const NON_SPA_PREFIXES = ["/api/", "/n/", "/shared/"];
 
 const APP_HEADERS = {
   "X-Content-Type-Options": "nosniff",
@@ -26,10 +30,14 @@ const APP_HEADERS = {
   ].join("; "),
 };
 
-/** DEMO defaults to on unless NODE_ENV=production (§13.6). */
+/**
+ * Demo mode (seed, demo clock, simulator, Reset demo): never in production, whatever DEMO says;
+ * otherwise on unless DEMO is set to something other than 1/true/on/yes (§13.6).
+ */
 export function isDemo(env = process.env) {
-  if (env.DEMO != null && env.DEMO !== "") return ["1", "true", "on", "yes"].includes(String(env.DEMO).toLowerCase());
-  return env.NODE_ENV !== "production";
+  if (env.NODE_ENV === "production") return false;
+  if (env.DEMO == null || env.DEMO === "") return true;
+  return ["1", "true", "on", "yes"].includes(String(env.DEMO).toLowerCase());
 }
 
 /** Maps any thrown error to an ApiError JSON body (§13.4). */
@@ -68,23 +76,25 @@ function spaFallback(req, res, next) {
 }
 
 /**
- * createApp({db, now, env, fetch?, extract?, clock?}) -> express app.
+ * createApp({db, now, env, publicUrl, fetch?, extract?, clock?}) -> express app.
  * now() returns the ISO time for each request (default: the demo-aware server clock).
+ * publicUrl is the address links in texts point at (default: PUBLIC_URL, else localhost:3000).
  * fetch is used for Twilio sends; extract replaces the AI extractor (tests).
  */
 export function createApp({
-  db, now = () => clock.now().toISOString(), env = process.env, fetch, extract, clock: clockApi = clock,
+  db, now = () => clock.now().toISOString(), env = process.env, publicUrl = resolvePublicUrl(env),
+  fetch, extract, clock: clockApi = clock,
 } = {}) {
   if (!db) throw new Error("createApp: db is required");
   const demo = isDemo(env);
   const sendText = (msg) => notify.send(msg, { db, now: now(), env, fetch });
   const deps = {
-    db, now, env, demo, fetch, extract, clock: clockApi, send: sendText,
-    aiOn: aiOnFor(extract),
+    db, now, env, publicUrl, demo, fetch, extract, clock: clockApi, send: sendText,
+    aiOn: () => Boolean(extract) || aiEnabled(),
     isShifted: () => clockApi.isShifted(),
     clockOffsetMs: () => (clockApi.isShifted() ? Date.parse(now()) - Date.now() : 0),
   };
-  const auth = createAuth({ env });
+  const auth = createAuth({ env, db, publicUrl });
 
   const app = express();
   app.disable("x-powered-by");
@@ -95,7 +105,7 @@ export function createApp({
   });
 
   // Webhooks first: they bring their own parsers, size limits and token/signature guards.
-  app.use(inboundRouter({ db, now, settings: () => repo.getSettings(db), send: sendText, demo, env }));
+  app.use(inboundRouter({ db, now, settings: () => repo.getSettings(db), send: sendText, demo, env, publicUrl }));
 
   app.use(express.json({ limit: LIMIT }));
   app.use(express.urlencoded({ extended: false, limit: LIMIT }));
@@ -110,7 +120,7 @@ export function createApp({
   if (demo) app.use("/api", simRouter(deps));
   app.use("/api", apiNotFound);
 
-  app.get("/n/:key", numbersPageHandler({ db, now, env }));
+  app.get("/n/:key", numbersPageHandler({ db, now, publicUrl }));
   app.get("/{*splat}", spaFallback);
 
   app.use(errorHandler);

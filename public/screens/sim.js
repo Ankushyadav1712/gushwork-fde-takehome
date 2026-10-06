@@ -16,16 +16,6 @@ const CLOCK_PRESETS = [
   { id: "next_fri_1500", label: "Next Fri 3:00pm" },
 ];
 
-const INBOUND_PRESETS = [
-  { id: "rosa_yes", label: "Rosa texts \"yes go ahead\"", note: "Attaches to her quote; suggests Mark as yes" },
-  { id: "lucia_repeat", label: "Lucia's Market texts again", note: "New job, Repeat - 1 past job" },
-  { id: "web_form_tony", label: "Web form: Tony's Bistro", note: "Freezer at 10F and rising; urgent" },
-  { id: "voicemail_carla", label: "Voicemail: Westside Diner", note: "Ice machine leaking; urgent" },
-  { id: "forward_midway", label: "You forward Midway Meats' text", note: "Matched by business name" },
-  { id: "spam_call", label: "Answered call, 8 seconds", note: "Ignored" },
-  { id: "answered_call", label: "Answered call, 2 minutes", note: "New job: what was it about?" },
-];
-
 const RESULT_TEXT = {
   created_job: "Created a new job.",
   attached: "Added to their open job.",
@@ -76,6 +66,7 @@ function ClockPanel({ health, tz, onMoved }) {
 
 function PresetsPanel({ onResult }) {
   const [busy, setBusy] = useState(null);
+  const presets = useAsync(() => api.getSimPresets(), []);
   async function send(id) {
     setBusy(id);
     try {
@@ -87,8 +78,9 @@ function PresetsPanel({ onResult }) {
   }
   return html`<section class="panel" aria-labelledby="pre-h">
     <h2 id="pre-h" class="panel-title">Inbound presets</h2>
+    ${!presets.data && (presets.error ? html`<${ErrorState} error=${presets.error} onRetry=${presets.reload} />` : html`<${Loading} />`)}
     <ul class="preset-list">
-      ${INBOUND_PRESETS.map((p) => html`<li key=${p.id}>
+      ${(presets.data?.items || []).map((p) => html`<li key=${p.id}>
         <button type="button" class="preset" disabled=${busy === p.id} onClick=${() => send(p.id)}>
           <span class="preset-label">${p.label}</span><span class="preset-note">${p.note}</span>
         </button>
@@ -220,7 +212,7 @@ export function SimScreen() {
     <${CustomInbound} onResult=${onResult} />
     <section aria-labelledby="sim-ob-h">
       <h2 id="sim-ob-h" class="divider">Outbox</h2>
-      ${outbox.data ? html`<${OutboxList} items=${outbox.data.items} />`
+      ${outbox.data ? html`<${OutboxList} items=${outbox.data.items} allStatuses />`
         : outbox.error ? html`<${ErrorState} error=${outbox.error} onRetry=${outbox.reload} />` : html`<${Loading} />`}
     </section>
     <section aria-labelledby="sim-in-h">

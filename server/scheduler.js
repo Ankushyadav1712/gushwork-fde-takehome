@@ -1,24 +1,22 @@
 // Texts to Denise on a clock (SPEC §11): the 7:00am digest (weekdays always, weekends only when
 // someone is waiting on a call back), the Friday 3pm sweep and one reminder per untouched lead.
-// tick() is idempotent: every text has a dedupe key, so running it twice sends nothing new.
+// tick() is idempotent: every text has a dedupe key, so running it twice sends nothing new. A text
+// that fails to send is tried again on a later tick, up to 3 tries, and the jobs it names get their
+// `notified` history line only once it went out.
 import { get, all, tx } from "./db.js";
 import * as clock from "./clock.js";
-import { getSettings, getJobViews, getJobView, outboxByDedupe, insertEvent } from "./repo.js";
-import { enqueue, deliver } from "./notify.js";
-import { buildToday, digestText, sweepText, nagText, CALL_FIRST } from "../shared/today-rules.js";
-import { replyIntent } from "../shared/parse.js";
+import { getJobViews, getJobView, insertEvent } from "./repo.js";
+import { enqueue, deliver, SENDING_NOTE } from "./notify.js";
+import { contextFor } from "./context.js";
+import { buildToday, digestText, sweepText, nagText, namedInDigest, namedInSweep } from "../shared/today-rules.js";
 import { localDate, localHM, weekdayOf, addMinutes } from "../shared/time.js";
 
 const TICK_MS = 60_000;
 const WINDOW_MINUTES = 180; // digest and sweep windows are 3 hours long
-const DIGEST_MAX_LINES = 6; // mirrors digestText
-const SWEEP_MAX_TITLES = 3; // mirrors sweepText
-/** Buckets the Friday sweep counts (mirrors shared/today-rules.js). */
-const SWEEP_BUCKETS = ["emergency", "replied", "new", "to_schedule", "quote"];
 const NAG_HOURS = ["07:00", "21:00"];
 const NAG_SKIP_MINUTES = 60;
 const NAG_AFTER_MINUTES = { urgent: 30, normal: 120 };
-const DEFAULT_PUBLIC_URL = "http://localhost:3000";
+const MAX_SEND_TRIES = 3;
 
 const NOTIFIED_SUMMARY = {
   weekday: "In your morning text",
@@ -40,35 +38,31 @@ function inWindow(hm, start, lengthMinutes) {
 }
 
 const isWeekend = (ymd) => [0, 6].includes(weekdayOf(ymd));
-const todayCards = (today) => today.sections.flatMap((s) => s.items);
+const wentOut = (row) => row?.status === "sent" || row?.status === "simulated";
 
-/** The context every shared rule gets at this tick. */
-export function tickContext(db, nowIso, deps = {}) {
-  const settings = deps.settings ?? getSettings(db);
-  const env = deps.env ?? process.env;
-  return {
-    now: nowIso,
-    tz: settings.timezone || "America/Chicago",
-    settings,
-    publicUrl: deps.publicUrl ?? env.PUBLIC_URL ?? DEFAULT_PUBLIC_URL,
-    replyIntent,
-  };
+/**
+ * The dedupe key for the next try at the text `key`, or null when it already went out, is still
+ * sending, or failed MAX_SEND_TRIES times. The first try uses `key`; retries use `key#2`, `key#3`,
+ * so every failed try stays in the outbox.
+ */
+function nextTryKey(db, key) {
+  const tries = all(db, "SELECT status, error FROM outbox WHERE dedupe_key = ? OR instr(dedupe_key, ?) = 1", [key, `${key}#`]);
+  const settled = tries.some((t) => t.status !== "failed" || t.error === SENDING_NOTE);
+  if (settled || tries.length >= MAX_SEND_TRIES) return null;
+  return tries.length === 0 ? key : `${key}#${tries.length + 1}`;
 }
 
-/** Jobs a digest lists by name: up to 6 lines (weekends: Call-first buckets only). */
-function digestJobIds(today, ymd) {
-  const cards = todayCards(today);
-  const listed = isWeekend(ymd) ? cards.filter((c) => CALL_FIRST.includes(c.bucket)) : cards;
-  return listed.slice(0, DIGEST_MAX_LINES).map((c) => c.job_id);
+/** The `notified` history line on each job a text named (actor system). */
+function recordNotified(db, { row, named, summary }) {
+  for (const jobId of named) {
+    insertEvent(db, {
+      job_id: jobId, at: row.created_at, kind: "notified", actor: "system", summary,
+      data: { outbox_id: row.id, kind: row.kind },
+    });
+  }
 }
 
-/** Jobs the Friday sweep lists by name: the first 3 titles. */
-function sweepJobIds(today) {
-  return todayCards(today).filter((c) => SWEEP_BUCKETS.includes(c.bucket))
-    .slice(0, SWEEP_MAX_TITLES).map((c) => c.job_id);
-}
-
-/** Queue one text to Denise and log a `notified` event on each job it names. */
+/** Queue one text to Denise. A simulated text has gone out already; a Twilio one once delivered. */
 function dispatch(db, ctx, deps, { kind, body, job_id = null, dedupe_key, named, summary }) {
   const { settings, now } = ctx;
   if (!settings.owner_phone) return null;
@@ -76,48 +70,43 @@ function dispatch(db, ctx, deps, { kind, body, job_id = null, dedupe_key, named,
     kind, body, job_id, dedupe_key, to_phone: settings.owner_phone, to_name: settings.owner_name ?? null,
   }, { now, env: deps.env ?? process.env });
   if (!row) return null;
-  for (const jobId of named) {
-    insertEvent(db, {
-      job_id: jobId, at: now, kind: "notified", actor: "system", summary,
-      data: { outbox_id: row.id, kind },
-    });
-  }
-  return row;
+  const text = { row, named, summary };
+  if (wentOut(row)) recordNotified(db, text);
+  return text;
 }
 
 function digestStep(db, ctx, deps, lazyToday) {
   const ymd = localDate(ctx.now, ctx.tz);
-  const key = `digest:${ymd}`;
   if (!inWindow(localHM(ctx.now, ctx.tz), ctx.settings.digest_time || "07:00", WINDOW_MINUTES)) return null;
-  if (outboxByDedupe(db, key)) return null;
+  const dedupeKey = nextTryKey(db, `digest:${ymd}`);
+  if (!dedupeKey) return null;
   const today = lazyToday();
   const { body, send } = digestText(today, ctx);
   if (!send) return null;
   return dispatch(db, ctx, deps, {
-    kind: "digest", body, dedupe_key: key, named: digestJobIds(today, ymd),
+    kind: "digest", body, dedupe_key: dedupeKey, named: namedInDigest(today, ctx),
     summary: isWeekend(ymd) ? NOTIFIED_SUMMARY.weekend : NOTIFIED_SUMMARY.weekday,
   });
 }
 
 function sweepStep(db, ctx, deps, lazyToday) {
   const ymd = localDate(ctx.now, ctx.tz);
-  const key = `sweep:${ymd}`;
   if (weekdayOf(ymd) !== 5 || ctx.settings.friday_sweep === false) return null;
   if (!inWindow(localHM(ctx.now, ctx.tz), "15:00", WINDOW_MINUTES)) return null;
-  if (outboxByDedupe(db, key)) return null;
+  const dedupeKey = nextTryKey(db, `sweep:${ymd}`);
+  if (!dedupeKey) return null;
   const today = lazyToday();
   const body = sweepText(today, ctx);
   if (!body) return null;
   return dispatch(db, ctx, deps, {
-    kind: "friday_sweep", body, dedupe_key: key, named: sweepJobIds(today), summary: NOTIFIED_SUMMARY.friday_sweep,
+    kind: "friday_sweep", body, dedupe_key: dedupeKey, named: namedInSweep(today), summary: NOTIFIED_SUMMARY.friday_sweep,
   });
 }
 
-/** Untouched `new` jobs that have never had a reminder. */
+/** Untouched `new` leads. Brain dump imports are her notebook backlog, not new arrivals, so never. */
 function nagCandidates(db) {
   return all(db, `SELECT id, urgent, created_at FROM jobs
-    WHERE stage = 'new' AND first_touch_at IS NULL
-      AND NOT EXISTS (SELECT 1 FROM outbox o WHERE o.dedupe_key = 'nag:' || jobs.id)
+    WHERE stage = 'new' AND first_touch_at IS NULL AND source <> 'bulk'
     ORDER BY created_at, id`);
 }
 
@@ -129,21 +118,35 @@ function recentlyNamed(db, jobId, now) {
       AND json_extract(data_json, '$.kind') IN ('digest', 'friday_sweep') LIMIT 1`, [jobId, since, now]));
 }
 
-function nagSteps(db, ctx, deps) {
+/** Reminders, skipping jobs a digest or sweep named just now (`namedNow`) or in the last hour. */
+function nagSteps(db, ctx, deps, namedNow) {
   const [from, until] = NAG_HOURS;
   if (!inWindow(localHM(ctx.now, ctx.tz), from, minutesOf(until) - minutesOf(from))) return [];
   const sent = [];
   for (const job of nagCandidates(db)) {
     const wait = job.urgent ? NAG_AFTER_MINUTES.urgent : NAG_AFTER_MINUTES.normal;
     if (Date.parse(addMinutes(job.created_at, wait)) > Date.parse(ctx.now)) continue;
-    if (recentlyNamed(db, job.id, ctx.now)) continue;
-    const row = dispatch(db, ctx, deps, {
+    const dedupeKey = nextTryKey(db, `nag:${job.id}`);
+    if (!dedupeKey || namedNow.has(job.id) || recentlyNamed(db, job.id, ctx.now)) continue;
+    const text = dispatch(db, ctx, deps, {
       kind: "nag", body: nagText(getJobView(db, job.id), ctx), job_id: job.id,
-      dedupe_key: `nag:${job.id}`, named: [job.id], summary: NOTIFIED_SUMMARY.nag,
+      dedupe_key: dedupeKey, named: [job.id], summary: NOTIFIED_SUMMARY.nag,
     });
-    if (row) sent.push(row);
+    if (text) sent.push(text);
   }
   return sent;
+}
+
+/** Send one queued Twilio text, then log it on the jobs it names if it went out. Never rejects. */
+async function deliverText(db, text, deps) {
+  if (wentOut(text.row)) return text.row;
+  const final = await deliver(text.row, { db, env: deps.env ?? process.env, fetch: deps.fetch });
+  try {
+    if (wentOut(final)) recordNotified(db, { ...text, row: final });
+  } catch (err) {
+    console.warn(`[scheduler] could not log outbox ${text.row.id} on its jobs (${err?.name ?? "Error"})`);
+  }
+  return final;
 }
 
 /**
@@ -152,15 +155,15 @@ function nagSteps(db, ctx, deps) {
  * where `delivered` settles once any Twilio sends finish (it never rejects).
  */
 export function tick(db, nowIso, deps = {}) {
-  const ctx = tickContext(db, nowIso, deps);
+  const ctx = contextFor(db, nowIso, { publicUrl: deps.publicUrl, settings: deps.settings });
   let today = null;
   const lazyToday = () => (today ??= buildToday(getJobViews(db, { scope: "all" }), ctx));
-  const sent = tx(db, () => [digestStep(db, ctx, deps, lazyToday), sweepStep(db, ctx, deps, lazyToday)]
-    .filter(Boolean)
-    .concat(nagSteps(db, ctx, deps)));
-  const env = deps.env ?? process.env;
-  const delivered = Promise.all(sent.map((row) => deliver(row, { db, env, fetch: deps.fetch })));
-  return { sent, delivered };
+  const queued = tx(db, () => {
+    const lists = [digestStep(db, ctx, deps, lazyToday), sweepStep(db, ctx, deps, lazyToday)].filter(Boolean);
+    return lists.concat(nagSteps(db, ctx, deps, new Set(lists.flatMap((text) => text.named))));
+  });
+  const delivered = Promise.all(queued.map((text) => deliverText(db, text, deps)));
+  return { sent: queued.map((text) => text.row), delivered };
 }
 
 /**

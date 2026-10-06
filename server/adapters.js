@@ -1,8 +1,9 @@
 // Provider adapters (SPEC §7.2): pure functions that turn one webhook payload into an
-// InboundEvent for ingest(). They never read the clock: the route stamps received_at.
-// Also the webhook signature checks for Twilio and Mailgun.
+// InboundEvent for ingest(). They never read the clock: the route stamps received_at and passes
+// the real time to the Mailgun check. Also the webhook signature checks for Twilio and Mailgun.
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { normalizePhone } from "../shared/format.js";
+import { normalizeEmail, looksLikeForm, formFieldFor } from "../shared/parse.js";
 
 export const VOICEMAIL_PLACEHOLDER = "(voicemail - no transcript yet)";
 const PHOTO_NOTE = "[photo attached]";
@@ -10,20 +11,12 @@ const PHOTO_NOTE = "[photo attached]";
 const MISSED_STATUSES = new Set(["no-answer", "busy", "failed", "canceled"]);
 const GENERIC_CALL_STATUSES = new Set(["missed", "voicemail", "answered"]);
 
-/** Form field aliases (§7.2). Keys are compared lowercased with non-alphanumerics removed. */
-const FORM_ALIASES = {
-  name: "name", fullname: "name", yourname: "name",
-  business: "business", company: "business", restaurant: "business", store: "business", businessname: "business",
-  phone: "phone", phonenumber: "phone", tel: "phone", mobile: "phone",
-  email: "email", emailaddress: "email",
-  address: "address", serviceaddress: "address", location: "address",
-  message: "message", details: "message", comments: "message", description: "message",
-  howcanwehelp: "message", issue: "message", problem: "message",
-};
 const FORM_ID_KEYS = ["submissionid", "entryid", "id"];
-const FORM_SKIPPED_KEYS = new Set([...FORM_ID_KEYS, "token"]);
-
-const FORM_LABEL_RE = /(?:^|\n|[ \t][/|][ \t])[ \t]*(name|business|phone|email|message)[ \t]*:/gi;
+// Form-builder plumbing that is never part of the lead.
+const FORM_SKIPPED_KEY_RE = /^(?:token|utm|gclid|fbclid|formid|formname|pageurl|referr?er|g?recaptcha)/;
+const MAX_HTML = 100_000; // longer HTML bodies are cut before tag stripping
+const MAX_MIME_DEPTH = 3;
+const MAILGUN_MAX_AGE_MS = 5 * 60_000;
 
 const keyOf = (s) => String(s).toLowerCase().replace(/[^a-z0-9]/g, "");
 const str = (v) => (v == null ? "" : String(v));
@@ -32,14 +25,14 @@ const orNull = (v) => {
   return s ? s : null;
 };
 
-/** Every InboundEvent field (minus received_at), with defaults. */
+/** Every InboundEvent field (minus received_at), with defaults. Emails are kept only when strictly valid. */
 function makeEvent(fields) {
   return {
     channel: fields.channel,
     provider: fields.provider,
     external_id: orNull(fields.external_id),
     from_phone: normalizePhone(fields.from_phone) ?? null,
-    from_email: orNull(fields.from_email)?.toLowerCase() ?? null,
+    from_email: normalizeEmail(fields.from_email),
     from_name: orNull(fields.from_name),
     subject: orNull(fields.subject),
     body: str(fields.body),
@@ -57,9 +50,13 @@ function toSeconds(value) {
 }
 
 // ---------------------------------------------------------------------------
-// Text helpers
+// HTML to text
 
 const ENTITIES = { amp: "&", lt: "<", gt: ">", quot: "\"", apos: "'", nbsp: " " };
+const SKIPPED_ELEMENTS = new Set(["script", "style", "head"]);
+const LINE_BREAK_TAGS = new Set(["br", "/p", "/div", "/tr", "/li", "/h1", "/h2", "/h3", "/h4", "/h5", "/h6", "/table", "/blockquote"]);
+const CELL_END_TAGS = new Set(["/td", "/th"]);
+const TAG_NAME_RE = /^(\/?)([a-z][a-z0-9]*)/i;
 
 function decodeEntities(s) {
   return s.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, (all, code) => {
@@ -71,30 +68,69 @@ function decodeEntities(s) {
   });
 }
 
-/** Plain text from an HTML email body: block tags become line breaks, entities are decoded. */
+/** What a tag becomes in plain text: a line break, a tab between table cells, or nothing. */
+function tagText(name) {
+  if (LINE_BREAK_TAGS.has(name)) return "\n";
+  return CELL_END_TAGS.has(name) ? "\t" : "";
+}
+
+/**
+ * Removes tags, comments and script/style/head blocks in one left-to-right pass. Every search
+ * starts where the last one ended and an unclosed construct ends the text, so it stays linear
+ * even on hostile input ("<a" repeated a million times).
+ */
+function stripTags(html) {
+  let out = "";
+  let i = 0;
+  while (i < html.length) {
+    const lt = html.indexOf("<", i);
+    if (lt === -1) return out + html.slice(i);
+    out += html.slice(i, lt);
+    if (html.startsWith("<!--", lt)) {
+      const end = html.indexOf("-->", lt + 4);
+      if (end === -1) return out;
+      i = end + 3;
+      continue;
+    }
+    const tag = TAG_NAME_RE.exec(html.slice(lt + 1, lt + 40));
+    const declaration = html[lt + 1] === "!" || html[lt + 1] === "?"; // <!DOCTYPE>, <?xml?>
+    if (!tag && !declaration) { // a bare "<" in text ("temp < 40")
+      out += "<";
+      i = lt + 1;
+      continue;
+    }
+    const gt = html.indexOf(">", lt + 1);
+    if (gt === -1) return out;
+    i = gt + 1;
+    if (declaration) continue;
+    const [, slash, rawName] = tag;
+    const name = rawName.toLowerCase();
+    if (!slash && SKIPPED_ELEMENTS.has(name)) {
+      const close = new RegExp(`</${name}\\s*>`, "ig");
+      close.lastIndex = i;
+      const end = close.exec(html);
+      if (!end) return out;
+      i = end.index + end[0].length;
+      continue;
+    }
+    out += tagText(`${slash}${name}`);
+  }
+  return out;
+}
+
+/** Plain text from an HTML email body: block tags become line breaks, table cells tabs, entities are decoded. */
 export function htmlToText(html) {
-  return decodeEntities(
-    str(html)
-      .replace(/<(script|style|head)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, "")
-      .replace(/<!--[\s\S]*?-->/g, "")
-      .replace(/<br\s*\/?>/gi, "\n")
-      .replace(/<\/(p|div|tr|li|h[1-6]|table|blockquote)\s*>/gi, "\n")
-      .replace(/<[^>]+>/g, ""),
-  )
+  return decodeEntities(stripTags(str(html).slice(0, MAX_HTML)))
     .replace(/\r\n?/g, "\n")
     .split("\n")
-    .map((line) => line.replace(/[ \t ]+/g, " ").trim())
+    .map((line) => line.replace(/[  ]+/g, " ").replace(/ ?\t[\s]*/g, "\t").trim())
     .join("\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
 }
 
-/** True when the text carries 2+ different website-form labels (Name:, Business:, Phone:, Email:, Message:). */
-export function detectFormEmail(text) {
-  const labels = new Set();
-  for (const m of str(text).replace(/\r\n?/g, "\n").matchAll(FORM_LABEL_RE)) labels.add(m[1].toLowerCase());
-  return labels.size >= 2;
-}
+// ---------------------------------------------------------------------------
+// Shared email helpers
 
 /**
  * Content hash for form submissions that carry no id (§7.1 step 1):
@@ -121,8 +157,18 @@ function parseAddress(value) {
   return { name: null, email: bare ? bare[0] : null };
 }
 
-function emailChannel(text) {
-  return detectFormEmail(text) ? "form" : "email";
+/** The address to answer: Reply-To when it holds an address (form mailers set it to the customer), else From. */
+function replyAddress(from, replyTo) {
+  const reply = parseAddress(replyTo);
+  return normalizeEmail(reply.email) ? reply : from;
+}
+
+function emailEvent({ provider, text, from, subject, messageId, raw }) {
+  return makeEvent({
+    channel: looksLikeForm(text) ? "form" : "email", provider,
+    external_id: cleanMessageId(messageId),
+    from_email: from.email, from_name: from.name, subject, body: text, raw,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -142,9 +188,12 @@ export function fromTwilioSms(p) {
 }
 
 /**
- * Twilio voice status / recording / transcription callbacks, mapped per the §7.2 call table:
- * a transcript or recording is a voicemail; no-answer/busy/failed/canceled is missed;
- * completed is answered (with its duration); anything else has call_status null (ingest ignores it).
+ * Twilio voice status / Dial action / recording / transcription callbacks:
+ * - a transcript or recording is a voicemail;
+ * - DialCallStatus completed is answered (Phase 2: <Dial> rang her cell), for DialCallDuration;
+ * - no-answer/busy/failed/canceled is missed, and so is a parent CallStatus completed with no
+ *   DialCallStatus (Phase 1: her carrier forwards only the calls she didn't pick up);
+ * - anything else (queued, ringing, in-progress) has call_status null, which ingest ignores.
  */
 export function fromTwilioVoice(p) {
   const transcript = orNull(p.TranscriptionText);
@@ -153,12 +202,10 @@ export function fromTwilioVoice(p) {
     return makeEvent({ ...base, call_status: "voicemail", body: transcript ?? VOICEMAIL_PLACEHOLDER,
       call_duration_s: toSeconds(p.RecordingDuration) });
   }
-  const status = str(p.DialCallStatus || p.CallStatus).toLowerCase();
-  if (MISSED_STATUSES.has(status)) return makeEvent({ ...base, call_status: "missed" });
-  if (status === "completed") {
-    return makeEvent({ ...base, call_status: "answered",
-      call_duration_s: toSeconds(p.DialCallDuration ?? p.CallDuration) ?? 0 });
-  }
+  const dial = str(p.DialCallStatus).toLowerCase();
+  if (dial === "completed") return makeEvent({ ...base, call_status: "answered", call_duration_s: toSeconds(p.DialCallDuration) ?? 0 });
+  const status = dial || str(p.CallStatus).toLowerCase();
+  if (MISSED_STATUSES.has(status) || status === "completed") return makeEvent({ ...base, call_status: "missed" });
   return makeEvent({ ...base, call_status: null });
 }
 
@@ -194,55 +241,51 @@ function headerValue(headers, name) {
   return hit ? hit.Value : null;
 }
 
-function emailEvent({ provider, text, fromEmail, fromName, subject, messageId, raw }) {
-  return makeEvent({
-    channel: emailChannel(text), provider,
-    external_id: cleanMessageId(messageId),
-    from_email: fromEmail, from_name: fromName, subject, body: text, raw,
-  });
-}
-
-/** Postmark inbound JSON: FromFull{Email,Name}, From, Subject, TextBody, HtmlBody, MessageID, Headers[]. */
+/** Postmark inbound JSON: FromFull{Email,Name}, From, ReplyTo, Subject, TextBody, HtmlBody, MessageID, Headers[]. */
 export function fromPostmark(p) {
   const from = p.FromFull?.Email ? { email: p.FromFull.Email, name: orNull(p.FromFull.Name) } : parseAddress(p.From);
   return emailEvent({
     provider: "postmark",
     text: orNull(p.TextBody) ? str(p.TextBody).trim() : htmlToText(p.HtmlBody),
-    fromEmail: from.email, fromName: from.name, subject: p.Subject,
+    from: replyAddress(from, p.ReplyTo ?? headerValue(p.Headers, "reply-to")),
+    subject: p.Subject,
     messageId: headerValue(p.Headers, "message-id") ?? p.MessageID,
     raw: p,
   });
 }
 
-/** Mailgun inbound route (urlencoded): sender, from, subject, body-plain, stripped-text, Message-Id. */
+/** Mailgun inbound route (urlencoded): sender, from, Reply-To, subject, body-plain, stripped-text, Message-Id. */
 export function fromMailgun(p) {
-  const from = parseAddress(p.from ?? p.From);
+  const parsed = parseAddress(p.from ?? p.From);
+  const from = parsed.email ? parsed : { name: parsed.name, email: orNull(p.sender) };
   const text = orNull(p["body-plain"]) ?? orNull(p["stripped-text"]);
   return emailEvent({
     provider: "mailgun",
     text: text ?? htmlToText(p["body-html"] ?? p["stripped-html"]),
-    fromEmail: from.email ?? orNull(p.sender), fromName: from.name, subject: p.subject ?? p.Subject,
+    from: replyAddress(from, p["Reply-To"] ?? p["reply-to"]),
+    subject: p.subject ?? p.Subject,
     messageId: p["Message-Id"] ?? p["message-id"] ?? p["Message-ID"],
     raw: p,
   });
 }
 
 /** Mailgun's signature fields, top level or nested under `signature` (newer webhooks). */
-function mailgunSignatureFields(p) {
+export function mailgunSignatureFields(p) {
   const nested = p?.signature && typeof p.signature === "object" ? p.signature : null;
   const src = nested ?? p ?? {};
   return { timestamp: src.timestamp, token: src.token, signature: src.signature };
 }
 
-/** Hex HMAC-SHA256 of timestamp + token with the webhook signing key. */
-export function mailgunSignature(signingKey, timestamp, token) {
-  return createHmac("sha256", str(signingKey)).update(`${str(timestamp)}${str(token)}`).digest("hex");
-}
-
-export function verifyMailgunSignature(signingKey, payload) {
+/**
+ * Mailgun's check: hex HMAC-SHA256 of timestamp + token with the signing key, and a timestamp
+ * within 5 minutes of nowMs (the real time, not the demo clock). The route rejects reused tokens.
+ */
+export function verifyMailgunSignature(signingKey, payload, nowMs) {
   const { timestamp, token, signature } = mailgunSignatureFields(payload);
   if (!signingKey || !timestamp || !token || typeof signature !== "string") return false;
-  return safeEqual(mailgunSignature(signingKey, timestamp, token), signature);
+  if (!(Math.abs(nowMs - Number(timestamp) * 1000) <= MAILGUN_MAX_AGE_MS)) return false;
+  const expected = createHmac("sha256", str(signingKey)).update(`${str(timestamp)}${str(token)}`).digest("hex");
+  return safeEqual(expected, signature);
 }
 
 const RFC_HEADERS = new Set([
@@ -253,11 +296,8 @@ const RFC_HEADERS = new Set([
 ]);
 const isRfcHeader = (name) => RFC_HEADERS.has(name) || /^(x|arc|list)-/.test(name);
 
-/**
- * Header lines up to the first blank line, or null when the leading block is not an email
- * header block (so a pasted "Name: ... / Phone: ..." form body is never eaten as headers).
- */
-function splitHeaders(text) {
+/** Header lines up to the first blank line, as {headers, body}; null when a line is not a header. */
+function readHeaderBlock(text, acceptName) {
   const end = text.indexOf("\n\n");
   const block = end === -1 ? text : text.slice(0, end);
   const headers = {};
@@ -268,12 +308,22 @@ function splitHeaders(text) {
       continue;
     }
     const m = /^([A-Za-z0-9-]+):[ \t]*(.*)$/.exec(line);
-    if (!m || !isRfcHeader(m[1].toLowerCase())) return null;
+    if (!m || !acceptName(m[1].toLowerCase())) return null;
     last = m[1].toLowerCase();
     headers[last] ??= m[2].trim();
   }
-  if (!headers.from && !headers.subject && !headers["message-id"]) return null;
   return { headers, body: end === -1 ? "" : text.slice(end + 2) };
+}
+
+/**
+ * An email's header block, or null when the leading block is not one (so a pasted
+ * "Name: ... / Phone: ..." form body is never eaten as headers).
+ */
+function splitHeaders(text) {
+  const split = readHeaderBlock(text, isRfcHeader);
+  if (!split) return null;
+  const { headers } = split;
+  return headers.from || headers.subject || headers["message-id"] ? split : null;
 }
 
 function decodeQuotedPrintable(s) {
@@ -288,27 +338,66 @@ function decodeQuotedPrintable(s) {
       bytes.push(...Buffer.from(soft[i], "utf8"));
     }
   }
-  return Buffer.from(bytes).toString("utf8");
+  return Buffer.from(bytes);
 }
 
-function decodeBody(body, headers) {
+/** "text/plain; charset=UTF-8" -> {type: "text/plain", params: {charset: "UTF-8"}}. */
+function contentType(value) {
+  const [type, ...rest] = str(value).split(";");
+  const params = {};
+  for (const part of rest) {
+    const m = /^\s*([a-z0-9-]+)\s*=\s*"?([^";]*)"?\s*$/i.exec(part);
+    if (m) params[m[1].toLowerCase()] = m[2];
+  }
+  return { type: type.trim().toLowerCase() || "text/plain", params };
+}
+
+function decodeCharset(bytes, charset) {
+  try {
+    return new TextDecoder(charset || "utf-8").decode(bytes);
+  } catch {
+    return new TextDecoder("utf-8").decode(bytes); // an unknown charset label
+  }
+}
+
+/** One MIME entity's text: its transfer encoding and charset decoded; HTML stripped; multipart unpacked. */
+function decodeBody(body, headers, depth = 0) {
+  const { type, params } = contentType(headers["content-type"]);
+  if (type.startsWith("multipart/") && params.boundary && depth < MAX_MIME_DEPTH) {
+    return decodeMultipart(body, params.boundary, depth);
+  }
   const encoding = str(headers["content-transfer-encoding"]).toLowerCase();
-  let text = body;
-  if (encoding === "quoted-printable") text = decodeQuotedPrintable(body);
-  else if (encoding === "base64") text = Buffer.from(body.replace(/\s+/g, ""), "base64").toString("utf8");
-  return /text\/html/i.test(str(headers["content-type"])) ? htmlToText(text) : text.trim();
+  let bytes = null;
+  if (encoding === "quoted-printable") bytes = decodeQuotedPrintable(body);
+  else if (encoding === "base64") bytes = Buffer.from(body.replace(/\s+/g, ""), "base64");
+  const text = bytes ? decodeCharset(bytes, params.charset) : body;
+  return type === "text/html" ? htmlToText(text) : text.trim();
 }
 
-/** A raw text/plain or message/rfc822 email: headers (From, Subject, Message-ID) until a blank line, then the body. */
+/** The first text/plain part of a multipart body, else the first text/html part (as text). */
+function decodeMultipart(body, boundary, depth) {
+  const parts = body.split(`--${boundary}`).slice(1).filter((part) => !part.startsWith("--"));
+  const entities = parts
+    .map((part) => part.replace(/^[ \t]*\n/, ""))
+    .map((part) => (part.startsWith("\n") ? { headers: {}, body: part.slice(1) } : readHeaderBlock(part, () => true)))
+    .filter(Boolean)
+    .map((entity) => ({ ...entity, type: contentType(entity.headers["content-type"]).type }));
+  const chosen = entities.find((e) => e.type === "text/plain")
+    ?? entities.find((e) => e.type.startsWith("multipart/"))
+    ?? entities.find((e) => e.type === "text/html");
+  return chosen ? decodeBody(chosen.body, chosen.headers, depth + 1) : "";
+}
+
+/** A raw text/plain or message/rfc822 email: headers (From, Reply-To, Subject, Message-ID) until a blank line, then the body. */
 export function fromRawEmail(rawText) {
   const text = str(rawText).replace(/\r\n?/g, "\n");
   const split = splitHeaders(text);
   const headers = split?.headers ?? {};
-  const from = parseAddress(headers.from);
   return emailEvent({
     provider: "raw",
     text: split ? decodeBody(split.body, headers) : text.trim(),
-    fromEmail: from.email, fromName: from.name, subject: headers.subject,
+    from: replyAddress(parseAddress(headers.from), headers["reply-to"]),
+    subject: headers.subject,
     messageId: headers["message-id"],
     raw: str(rawText),
   });
@@ -317,16 +406,35 @@ export function fromRawEmail(rawText) {
 // ---------------------------------------------------------------------------
 // Website forms
 
+/** A field's value as one line of text: lists and objects ({street, city}) are joined with ", ". */
 function fieldText(value) {
   if (value == null) return "";
-  if (Array.isArray(value)) return value.map(fieldText).filter(Boolean).join(", ");
-  if (typeof value === "object") return JSON.stringify(value);
+  if (typeof value === "object") return Object.values(value).map(fieldText).filter(Boolean).join(", ");
   return String(value).trim();
 }
 
+/** "fields[name]" -> "name"; an object under an unknown key ({data: {name, phone}}) is flattened one level. */
+function formEntries(payload) {
+  const entries = [];
+  for (const [rawKey, value] of Object.entries(payload)) {
+    const key = /\[([^\]]+)\]$/.exec(rawKey)?.[1] ?? rawKey;
+    const nested = value && typeof value === "object" && !Array.isArray(value) && !formFieldFor(key);
+    if (nested) entries.push(...Object.entries(value));
+    else entries.push([key, value]);
+  }
+  return entries;
+}
+
+/** Free text with no field of its own (the longest unaliased value of 3+ words) stands in for the message. */
+function messageFromExtras(extras) {
+  const prose = extras.filter((e) => e.text.split(/\s+/).length >= 3);
+  return prose.sort((a, b) => b.text.length - a.text.length)[0] ?? null;
+}
+
 /**
- * A direct website-form webhook (JSON or urlencoded). Aliased fields become form_fields;
- * message-like fields become the body; unknown fields are appended as "Key: value".
+ * A direct website-form webhook (JSON or urlencoded). Fields the parser knows (shared/parse.js
+ * label names) become form_fields; message-like fields become the body; unknown fields are
+ * appended as "Key: value"; ids and tracking fields are dropped.
  */
 export function fromForm(p) {
   const payload = p && typeof p === "object" ? p : { message: str(p) };
@@ -334,22 +442,25 @@ export function fromForm(p) {
   const messages = [];
   const extras = [];
   let externalId = null;
-  for (const [key, value] of Object.entries(payload)) {
+  for (const [key, value] of formEntries(payload)) {
     const k = keyOf(key);
     const text = fieldText(value);
     if (FORM_ID_KEYS.includes(k)) externalId ??= orNull(text);
-    if (FORM_SKIPPED_KEYS.has(k) || !text) continue;
-    const alias = FORM_ALIASES[k];
-    if (alias === "message") messages.push(text);
-    else if (alias) known[alias] ??= text;
-    else extras.push(`${key}: ${text}`);
+    if (FORM_ID_KEYS.includes(k) || FORM_SKIPPED_KEY_RE.test(k) || !text) continue;
+    const field = formFieldFor(key);
+    if (field === "message") messages.push(text);
+    else if (field) known[field] ??= text;
+    else extras.push({ key, text });
   }
+  const standIn = messages.length ? null : messageFromExtras(extras);
+  if (standIn) messages.push(standIn.text);
   if (messages.length) known.message = messages.join("\n");
+  const name = known.contact_name ?? ([known.first_name, known.last_name].filter(Boolean).join(" ") || null);
   return makeEvent({
     channel: "form", provider: "form",
     external_id: externalId,
-    from_phone: known.phone, from_email: known.email, from_name: known.name,
-    body: [...messages, ...extras].join("\n"),
+    from_phone: known.phone, from_email: known.email, from_name: name,
+    body: [...messages, ...extras.filter((e) => e !== standIn).map((e) => `${e.key}: ${e.text}`)].join("\n"),
     form_fields: Object.keys(known).length ? known : null,
     raw: p,
   });
@@ -380,19 +491,23 @@ function genericEmail(p) {
   return emailEvent({
     provider: "generic",
     text: orNull(p.text) ? str(p.text).trim() : htmlToText(p.html),
-    fromEmail: from.email, fromName: orNull(p.from_name) ?? from.name, subject: p.subject,
+    from: replyAddress({ email: from.email, name: orNull(p.from_name) ?? from.name }, p.reply_to),
+    subject: p.subject,
     messageId: p.message_id, raw: p,
   });
 }
 
-/** Generic JSON payload for one channel: sms {from, body, id?}, call {from, status, duration_s?, voicemail_text?, id?}, email {from, from_name?, subject?, text, message_id?}, form (see fromForm). */
+/**
+ * Generic JSON payload (an object) for one channel: sms {from, body, id?}, call {from, status,
+ * duration_s?, voicemail_text?, id?}, email {from, from_name?, reply_to?, subject?, text, message_id?},
+ * form (see fromForm).
+ */
 export function fromGeneric(channel, p) {
-  const payload = p && typeof p === "object" ? p : {};
   switch (channel) {
-    case "sms": return genericSms(payload);
-    case "call": return genericCall(payload);
-    case "email": return genericEmail(payload);
-    case "form": return { ...fromForm(payload), provider: "generic" };
+    case "sms": return genericSms(p);
+    case "call": return genericCall(p);
+    case "email": return genericEmail(p);
+    case "form": return { ...fromForm(p), provider: "generic" };
     default: throw new Error(`fromGeneric: unknown channel ${channel}`);
   }
 }

@@ -2,8 +2,10 @@
 // (server clock, settings, outcome sheet, toast with Undo, auto-open after Call/Text).
 import { html, render, useState, useEffect, useCallback, useRef, useMemo } from "/vendor/preact-htm.js";
 import * as api from "./api.js";
-import { AppContext } from "./ui/common.js";
-import { DEFAULT_TZ, ERROR_COPY } from "./ui/constants.js";
+import { DEFAULT_TZ } from "/shared/time.js";
+import { techText } from "/shared/templates.js";
+import { AppContext, smsHref } from "./ui/common.js";
+import { ERROR_COPY } from "./ui/constants.js";
 import { Icon } from "./ui/icons.js";
 import { useToast, Toast } from "./ui/toast.js";
 import { OutcomeSheet } from "./screens/outcome-sheet.js";
@@ -92,6 +94,17 @@ function writePendingTap(value) {
   } catch { /* storage can be unavailable (private mode); the in-memory copy still works */ }
 }
 
+/** "Text Mike" for the toast after booking a tech who has a cell in Settings (§9 "Text a tech"). */
+function techTextLink(job, techName, settings) {
+  const tech = techName && job ? (settings?.techs || []).find((t) => t.name === techName) : null;
+  if (!tech?.phone) return null;
+  return {
+    label: `Text ${tech.name}`,
+    href: smsHref(tech.phone, techText(job, { settings })),
+    onClick: () => api.postTap(job.id, "tech_text", tech.name).catch(() => {}),
+  };
+}
+
 function App() {
   const route = useRoute();
   const [health, setHealth] = useState(null);
@@ -101,6 +114,8 @@ function App() {
   const [version, setVersion] = useState(0);
   const [toast, showToast, dismissToast] = useToast();
   const offset = useRef(0);
+  const settingsRef = useRef(null);
+  settingsRef.current = settings;
   const pendingTap = useRef(readPendingTap());
 
   const setServerNow = useCallback((iso) => {
@@ -170,9 +185,13 @@ function App() {
     bump();
   }, []);
 
-  const outcomeSaved = useCallback((jobId, result) => {
+  // `tech` is the tech just booked on the job, if any.
+  const outcomeSaved = useCallback((jobId, result, { tech = null } = {}) => {
     const undoable = result?.event_id != null;
-    showToast(result?.toast || "Saved.", { undo: undoable ? () => undo(jobId, result.event_id) : null });
+    showToast(result?.toast || "Saved.", {
+      undo: undoable ? () => undo(jobId, result.event_id) : null,
+      link: techTextLink(result?.job, tech, settingsRef.current),
+    });
     // Let the card slide out before the list refetches.
     setTimeout(bump, SAVED_SLIDE_MS);
   }, []);

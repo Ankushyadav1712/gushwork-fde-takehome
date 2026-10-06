@@ -1,5 +1,6 @@
 // Numbers for her husband (§10). Rolling windows: (now - N days, now]. Jobs closed as
-// `not_a_job` are left out of every metric. Pure: `now` comes from ctx.
+// `not_a_job` are left out of every metric, and Brain dump imports (her notebook backlog) don't
+// count as new work. Pure: `now` comes from ctx.
 
 import { OPEN_STAGES, stageShort } from "./stages.js";
 import { shortDateLabel } from "./time.js";
@@ -7,6 +8,8 @@ import { money, plural } from "./format.js";
 
 const DAY_MS = 86_400_000;
 const HOUR_MS = 3_600_000;
+/** Stages that mean the customer said yes. A job moved back to a quote isn't won, so no job is both. */
+const WON_STAGES = ["to_schedule", "scheduled", "done"];
 
 function inWindow(iso, nowMs, days) {
   if (iso == null) return false;
@@ -33,7 +36,7 @@ export function computeNumbers(jobViews, ctx) {
   const open = jobs.filter((j) => OPEN_STAGES.includes(j.stage));
   const stageCounts = Object.fromEntries(OPEN_STAGES.map((s) => [s, open.filter((j) => j.stage === s).length]));
   const waitingYes = open.filter((j) => j.stage === "waiting_yes");
-  const won = jobs.filter((j) => j.stage !== "lost" && inWindow(j.won_at, nowMs, 30));
+  const won = jobs.filter((j) => WON_STAGES.includes(j.stage) && inWindow(j.won_at, nowMs, 30));
   const lost = jobs.filter((j) => j.stage === "lost" && inWindow(j.lost_at, nowMs, 30));
   return {
     now: ctx.now,
@@ -49,15 +52,15 @@ export function computeNumbers(jobViews, ctx) {
     done_7d_count: jobs.filter((j) => j.stage === "done" && inWindow(j.done_at, nowMs, 7)).length,
     lost_30d_count: lost.length,
     lost_30d_went_elsewhere: lost.filter((j) => j.lost_reason === "went_elsewhere").length,
-    new_7d_count: jobs.filter((j) => inWindow(j.created_at, nowMs, 7)).length,
+    new_7d_count: jobs.filter((j) => j.source !== "bulk" && inWindow(j.created_at, nowMs, 7)).length,
     ...leakFor(jobs, nowMs),
   };
 }
 
 /** The plain-text summary (§10): "Text this to Rick", Copy and the read-only page. */
 export function numbersText(numbers, ctx) {
-  const company = ctx?.settings?.company_name || "Frostline Refrigeration";
-  const date = ctx?.now ? shortDateLabel(ctx.now, ctx.tz) : numbers.date_label;
+  const company = ctx.settings.company_name;
+  const date = shortDateLabel(ctx.now, ctx.tz);
   const byStage = OPEN_STAGES.map((s) => `${stageShort(s)} ${numbers.stage_counts[s] ?? 0}`).join(", ");
   const lostDetail = numbers.lost_30d_count > 0 ? ` (${numbers.lost_30d_went_elsewhere} went with someone else)` : "";
   return [

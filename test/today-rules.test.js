@@ -1,8 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  BUCKETS, isDue, isOnToday, bucketFor, replySuggestion, localReplyIntent, reasonFor, chipFor, cardFor,
-  compareCards, buildToday, digestText, sweepText, nagText, stripText,
+  isDue, isOnToday, bucketFor, replySuggestion, reasonFor, chipFor, cardFor,
+  compareCards, buildToday, digestText, sweepText, nagText,
 } from "../shared/today-rules.js";
 import {
   SEED_ANCHOR as A, SETTINGS, at, ctxAt, makeJobView, applyAt, receiveInbound, seedJobViews,
@@ -59,7 +59,8 @@ test("T03 bucket precedence", () => {
   assert.equal(new Set(ids).size, ids.length, "a job never appears twice");
   assert.equal(ids.length, table.filter(([, , b]) => b).length);
   for (const s of today.sections) for (const c of s.items) assert.equal(c.bucket, s.bucket);
-  assert.deepEqual(today.sections.map((s) => s.bucket), BUCKETS.map((b) => b.id)); // all seven, in order
+  assert.deepEqual(today.sections.map((s) => s.bucket), // all seven, in order
+    ["emergency", "replied", "new", "to_schedule", "quote", "nudge", "check_done"]);
 });
 
 test("T04 seed: Today at A matches §12.3 exactly", () => {
@@ -86,14 +87,14 @@ test("T04 seed: Today at A matches §12.3 exactly", () => {
   ]);
   assert.deepEqual(rows, [
     [1, "Bella Cucina", ["URGENT"], "Walk-in freezer at 28 degrees and climbing - voicemail Fri 4:47pm, nobody's called back", "Not contacted - 2d 14h (red)"],
-    [2, "Harbor Grill", [], "Texted yesterday 6:05pm: \"Can Mike come Wednesday instead of Tuesday? We're closed…\"", "12h (grey)"],
+    [2, "Harbor Grill", [], "Texted yesterday 6:05pm: \"Can Mike come Wednesday instead of Tuesday? We're closed…\"", "Waiting 12h (grey)"],
     [3, "(312) 555-0177", [], "New - missed call Sat 1:12pm - no voicemail", "Not contacted - 1d 17h (amber)"],
     [4, "Fresh Mart #2", [], "New - web form today 6:02am - Deli ice machine making half the ice", "Not contacted - 58m (grey)"],
-    [5, "Joe's Diner", ["Repeat - 1 past job"], "Said yes Fri - not scheduled yet - hasn't heard from us in 3 days", "2d 17h (red)"],
-    [6, "Midway Meats", [], "Waiting on your quote since Wed - hasn't heard from us in 5 days", "4d 20h (red)"],
-    [7, "Hillside Grocery", [], "Waiting on your quote since Thu - hasn't heard from us in 4 days", "3d 20h (red)"],
-    [8, "Lakeview Brewing Co.", [], "Waiting on your quote since Fri - hasn't heard from us in 3 days", "2d 21h (red)"],
-    [9, "Rosa's Taqueria", ["Repeat - 1 past job"], "Quote sent Thu, $2,400 - no answer in 4 days", "3d 16h (amber)"],
+    [5, "Joe's Diner", ["Repeat - 1 past job"], "Said yes Fri - not scheduled yet - hasn't heard from us in 3 days", "Waiting 2d 17h (red)"],
+    [6, "Midway Meats", [], "Waiting on your quote since Wed - hasn't heard from us in 5 days", "Waiting 4d 20h (red)"],
+    [7, "Hillside Grocery", [], "Waiting on your quote since Thu - hasn't heard from us in 4 days", "Waiting 3d 20h (red)"],
+    [8, "Lakeview Brewing Co.", [], "Waiting on your quote since Fri - hasn't heard from us in 3 days", "Waiting 2d 21h (red)"],
+    [9, "Rosa's Taqueria", ["Repeat - 1 past job"], "Quote sent Thu, $2,400 - no answer in 4 days", "Waiting 3d 16h (amber)"],
     [10, "Sal's Pizza", [], "Luis went Fri - done?", null],
   ]);
 
@@ -111,12 +112,12 @@ test("T04 seed: Today at A matches §12.3 exactly", () => {
 
   assert.deepEqual(today.stage_counts, { new: 3, quote: 3, waiting_yes: 2, to_schedule: 2, scheduled: 3 });
   assert.equal(today.open_count, 13);
-  assert.equal(stripText(today.stage_counts), "New 3 · Waiting on quote 3 · Their yes 2 · Said yes 2 · Scheduled 3");
   assert.deepEqual(today.strip.map((s) => `${s.label} ${s.count}`).join(" · "), "New 3 · Waiting on quote 3 · Their yes 2 · Said yes 2 · Scheduled 3");
   assert.deepEqual(today.footer, {
-    scheduled_today: 1, snoozed: 1, text: "Scheduled today: 1 · Snoozed: 1",
+    scheduled_today: 1, snoozed: 1, text: "Scheduled today: 1 · Put off till later: 1",
     last24h_text: "Last 24 hours: 1 came in, 1 not called yet",
   });
+  assert.equal(today.empty, null);
   assert.deepEqual(today.demo, { shifted: false, label: null });
   assert.equal(today.now, A);
 });
@@ -135,9 +136,10 @@ test("seed cards: links, sheet data and outcome buttons", () => {
     at: at("2026-10-04 18:05"), at_label: "yesterday 6:05pm", channel: "sms",
     body: "Can Mike come Wednesday instead of Tuesday? We're closed Tuesdays.",
   });
+  assert.equal(harbor.suggestion, "move_day");
   assert.deepEqual(harbor.outcomes.map((b) => b.label),
-    ["Moved to another day", "Done", "Needs another visit", "Needs a quote for more work", "Seen it", "Not today", "Cancelled"]);
-  assert.equal(harbor.suggestion, null);
+    ["Move to Wednesday?", "Done", "Needs another visit", "Needs a quote for more work", "Seen it", "Not today", "Cancelled"]);
+  assert.deepEqual(harbor.outcomes[0].preset, { visit_date: "2026-10-07" });
 
   const sals = cards[9];
   assert.deepEqual(sals.outcomes.map((b) => b.label),
@@ -186,7 +188,7 @@ test("§12.4 texts: weekday and weekend digests, Friday sweep, reminders", () =>
 
 test("digest edge cases: nobody waiting, weekend off, more than 6, custom URL", () => {
   const empty = buildToday([], ctx);
-  assert.equal(empty.header, "All caught up");
+  assert.equal(empty.header, null);
   assert.equal(empty.waiting_yes_text, null);
   assert.equal(empty.footer.last24h_text, "Nothing new in the last 24 hours");
   assert.deepEqual(digestText(empty, ctx),
@@ -300,7 +302,7 @@ test("T09 an urgent quote outranks a reply", () => {
   const cards = buildToday([replied, urgentQuote], ctxAt(now)).sections.flatMap((s) => s.items);
   assert.deepEqual(cards.map((c) => [c.job_id, c.bucket]), [[2, "emergency"], [1, "replied"]]);
   assert.equal(cards[0].reason, "Walk-in cooler not cold - waiting on your quote since today");
-  assert.deepEqual(cards[0].chip, { text: "2h", tone: "red" });
+  assert.deepEqual(cards[0].chip, { text: "Waiting 2h", tone: "red" });
 });
 
 test("T10 snooze, a reply during it, Seen it, then back on the snooze date", () => {
@@ -350,19 +352,19 @@ test("T11 three tries suggests Mark lost", () => {
   assert.equal(newCard.outcomes[0].label, "Mark lost");
 });
 
-test("reply suggestions (§4.12) with the local keywords or an injected replyIntent", () => {
-  assert.equal(localReplyIntent("yes go ahead, thursday works for us"), "yes");
-  assert.equal(localReplyIntent("no thanks, we went with someone else"), "no");
-  assert.equal(localReplyIntent("yes but not right now"), null);
-  assert.equal(localReplyIntent("Can Mike come Wednesday?"), null);
-
-  const withReply = (stage, body) => makeJobView({ stage, next_due_at: WED_0000, unread_inbound_at: A,
-    last_inbound: { at: A, channel: "sms", call_status: null, body } });
-  assert.equal(replySuggestion(withReply("waiting_yes", "yes go ahead, thursday works for us")), "mark_yes");
-  assert.equal(replySuggestion(withReply("quote", "no thanks, we went with someone else")), "mark_lost");
-  assert.equal(replySuggestion(withReply("to_schedule", "yes go ahead")), null);
-  assert.equal(replySuggestion({ ...withReply("waiting_yes", "yes go ahead"), unread_inbound_at: null }), null);
-  assert.equal(replySuggestion(withReply("waiting_yes", "anything"), { replyIntent: () => "no" }), "mark_lost");
+test("reply suggestions (§4.12): yes / no on a quote, another day on a visit", () => {
+  const withReply = (stage, body, extra = {}) => makeJobView({ stage, next_due_at: WED_0000, unread_inbound_at: A,
+    last_inbound: { at: A, channel: "sms", call_status: null, body }, ...extra });
+  assert.equal(replySuggestion(withReply("waiting_yes", "yes go ahead, thursday works for us"), ctx), "mark_yes");
+  assert.equal(replySuggestion(withReply("quote", "no thanks, we went with someone else"), ctx), "mark_lost");
+  assert.equal(replySuggestion(withReply("waiting_yes", "yes but not right now"), ctx), null, "both");
+  assert.equal(replySuggestion(withReply("waiting_yes", "Can Mike come Wednesday?"), ctx), null, "neither");
+  assert.equal(replySuggestion(withReply("to_schedule", "yes go ahead"), ctx), null);
+  assert.equal(replySuggestion({ ...withReply("waiting_yes", "yes go ahead"), unread_inbound_at: null }, ctx), null);
+  const visit = { visit_date: "2026-10-06" };
+  assert.equal(replySuggestion(withReply("scheduled", "Can Mike come Wednesday instead?", visit), ctx), "move_day");
+  assert.equal(replySuggestion(withReply("scheduled", "See you Tuesday!", visit), ctx), null, "that's the day it's booked");
+  assert.equal(replySuggestion(withReply("scheduled", "Thanks!", visit), ctx), null);
 
   const card = cardFor(withReply("waiting_yes", "yes go ahead, thursday works for us"), ctx);
   assert.equal(card.bucket, "replied");
@@ -393,6 +395,8 @@ test("reason templates for every case (§4.6)", () => {
   assert.equal(r({ stage: "waiting_yes", ...msg("call", "voicemail", "Hi it's Rosa, call me back about the quote please") }),
     "Called today 6:00am: \"Hi it's Rosa, call me back about the quote please\"");
   assert.equal(r({ stage: "scheduled", ...msg("call", "answered", "") }), "You talked today 6:00am - what happened?");
+  assert.equal(r({ stage: "quote", ...msg("manual", null, "any update on that freezer door quote?") }),
+    "You pasted in their message today 6:00am: \"any update on that freezer door quote?\"");
   assert.equal(r({ source: "call", source_detail: "answered", problem: null }), "New - call Fri 4:47pm - what was it about?");
   assert.equal(r({ source: "bulk", problem: null }), "New - from your notebook Fri 4:47pm - no details");
   assert.equal(r({ stage: "quote", stage_entered_at: at("2026-10-04 09:00"), last_touch_at: at("2026-10-04 09:00") }),
@@ -414,8 +418,9 @@ test("chips and tones (§4.7)", () => {
   assert.deepEqual(chip({ created_at: at("2026-10-04 06:00") }), { text: "Not contacted - 1d 1h", tone: "amber" });
   assert.deepEqual(chip({ created_at: at("2026-10-03 07:00") }), { text: "Not contacted - 2d", tone: "red" });
   assert.deepEqual(chip({ urgent: 1, created_at: at("2026-10-05 06:59") }), { text: "Not contacted - 1m", tone: "red" });
-  assert.deepEqual(chip({ stage: "quote", stage_entered_at: at("2026-10-04 07:01") }), { text: "23h", tone: "grey" });
-  assert.deepEqual(chip({ stage: "waiting_yes", quote_sent_at: at("2026-10-01 07:00") }), { text: "4d", tone: "amber" });
+  assert.deepEqual(chip({ stage: "quote", stage_entered_at: at("2026-10-04 07:01") }), { text: "Waiting 23h", tone: "grey" });
+  assert.deepEqual(chip({ stage: "waiting_yes", quote_sent_at: at("2026-10-01 07:00") }), { text: "Waiting 4d", tone: "amber" });
+  assert.deepEqual(chip({ stage: "waiting_yes", next_due_at: WED_0000, unread_inbound_at: A }), { text: "Just now", tone: "grey" });
   assert.deepEqual(chip({ stage: "to_schedule", snoozed_until: at("2026-10-02 00:00"), stage_entered_at: at("2026-10-01 07:00") }),
     { text: "Call back was Fri", tone: "red" });
   assert.equal(chip({ stage: "scheduled", visit_date: "2026-10-02" }), null);
@@ -437,6 +442,25 @@ test("footer trust line (§4.8)", () => {
     makeJobView({ id: 3, created_at: at("2026-10-04 07:00"), stage: "new" }), // exactly 24h ago: outside the window
   ];
   assert.equal(buildToday(handled, ctx).footer.last24h_text, "Last 24 hours: 1 came in, all handled");
+});
+
+test("regression RT-4: Brain dump imports didn't 'come in' today", () => {
+  const imported = [
+    makeJobView({ id: 1, source: "bulk", created_at: at("2026-10-05 06:00") }),
+    makeJobView({ id: 2, source: "bulk", created_at: at("2026-10-05 06:00"), stage: "to_schedule" }),
+  ];
+  assert.equal(buildToday(imported, ctx).footer.last24h_text, "Nothing new in the last 24 hours");
+  const lead = makeJobView({ id: 3, source: "sms", created_at: at("2026-10-05 06:30") });
+  assert.equal(buildToday([...imported, lead], ctx).footer.last24h_text, "Last 24 hours: 1 came in, 1 not called yet");
+});
+
+test("UX-2: the empty state says whether jobs are only put off till later", () => {
+  const snoozed = makeJobView({ id: 1, stage: "quote", next_due_at: WED_0000, snoozed_until: WED_0000 });
+  const putOff = buildToday([snoozed], ctx);
+  assert.deepEqual([putOff.count, putOff.header], [0, null]);
+  assert.deepEqual(putOff.empty, { title: "Nothing due right now.", text: "1 put off till later - they'll come back on their day." });
+  assert.equal(putOff.footer.text, "Scheduled today: 0 · Put off till later: 1");
+  assert.deepEqual(buildToday([], ctx).empty, { title: "All caught up.", text: "Nobody's waiting on you." });
 });
 
 test("an email-only lead's card carries the email so it can be answered from Today", () => {

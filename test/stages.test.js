@@ -1,9 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
 import {
   STAGES, OPEN_STAGES, DENISE_OWES, LOST_REASONS, EQUIPMENT, OUTCOMES, OutcomeError,
-  isOpen, canTransition, enterStage, outcomesFor, applyOutcome, offeredOutcomes, promotionFor, moveStage,
+  isOpen, canTransition, enterStage, outcomesFor, applyOutcome, promotionFor, moveStage, askedForDay,
   stageLabel, equipmentLabel,
 } from "../shared/stages.js";
 import { SEED_ANCHOR as A, at, ctxAt, makeJobView } from "./fixtures/seed-state.js";
@@ -14,6 +13,8 @@ const TUE_0000 = "2026-10-06T05:00:00.000Z";
 const WED_0000 = "2026-10-07T05:00:00.000Z";
 
 const isIso = (s) => typeof s === "string" && new Date(s).toISOString() === s;
+/** The outcome ids the sheet offers for this job (every one of them must be accepted by applyOutcome). */
+const offeredIds = (job) => outcomesFor(job, ctx).map((b) => b.id);
 const outcomeError = (code) => (err) => err instanceof OutcomeError && err instanceof Error && err.code === code;
 
 function deepFreeze(obj) {
@@ -87,12 +88,6 @@ test("stage constants (§3)", () => {
   assert.equal(equipmentLabel(null), null);
 });
 
-test("equipment ids match server/ai.js", () => {
-  const src = readFileSync(new URL("../server/ai.js", import.meta.url), "utf8");
-  const list = /const EQUIPMENT = \[([^\]]+)\]/.exec(src)[1].match(/"([a-z_]+)"/g).map((s) => s.slice(1, -1));
-  assert.deepEqual(EQUIPMENT.map((e) => e.id), list);
-});
-
 test("isOpen and canTransition", () => {
   for (const s of OPEN_STAGES) assert.equal(isOpen(s), true);
   assert.equal(isOpen("done"), false);
@@ -161,6 +156,18 @@ test("enterStage: per-stage dates and fields (§3)", () => {
   assert.equal(enterStage(job, "lost", ctx).lost_reason, null);
 });
 
+test("regression RT-3: moving between done and lost drops the other closed stage's fields", () => {
+  const notAJob = jobIn("lost", { lost_reason: "not_a_job" });
+  assert.deepEqual(pick(enterStage(notAJob, "done", ctx, { amount: 350 }), ["stage", "lost_at", "lost_reason", "done_at", "quote_amount"]),
+    { stage: "done", lost_at: null, lost_reason: null, done_at: A, quote_amount: 350 });
+  assert.deepEqual(pick(enterStage(jobIn("done"), "lost", ctx, { lost_reason: "price" }), ["stage", "done_at", "lost_at", "lost_reason"]),
+    { stage: "lost", done_at: null, lost_at: A, lost_reason: "price" });
+  // A visit date only belongs to a job that is (or was) booked: leaving for an earlier stage drops it.
+  for (const to of ["new", "quote", "waiting_yes", "to_schedule"]) {
+    assert.equal(enterStage(jobIn("scheduled"), to, ctx).visit_date, null, to);
+  }
+});
+
 test("enterStage: reopening clears the closed fields and keeps won_at", () => {
   const lost = jobIn("lost", { won_at: at("2026-09-30 10:00") });
   const patch = enterStage(lost, "new", ctx);
@@ -174,8 +181,7 @@ test("T02 invariant: every offered outcome keeps open <=> next_due_at", () => {
   let checked = 0;
   for (const stage of OPEN_STAGES) {
     const job = deepFreeze(jobIn(stage, { unread_inbound_at: at("2026-10-05 06:00") }));
-    const offered = offeredOutcomes(job);
-    assert.deepEqual(new Set(outcomesFor(job, ctx).map((b) => b.id)), new Set(offered), stage);
+    const offered = offeredIds(job);
     const tries = offered.map((id) => [id, SAMPLE_ARGS[id]]);
     if (offered.includes("yes")) tries.push(["yes", { visit_date: null }]);
     for (const [id, args] of tries) {
@@ -210,7 +216,7 @@ test("T02 invariant: every offered outcome keeps open <=> next_due_at", () => {
 test("applyOutcome never mutates its input", () => {
   const job = deepFreeze(jobIn("waiting_yes", { unread_inbound_at: at("2026-10-05 06:00") }));
   const before = JSON.stringify(job);
-  for (const id of offeredOutcomes(job)) applyOutcome(job, id, SAMPLE_ARGS[id], ctx);
+  for (const id of offeredIds(job)) applyOutcome(job, id, SAMPLE_ARGS[id], ctx);
   assert.equal(JSON.stringify(job), before);
 });
 
@@ -233,7 +239,7 @@ test("contact outcomes set last_touch_at / first_touch_at; the rest leave them a
   for (const stage of OPEN_STAGES) {
     const fresh = jobIn(stage, { unread_inbound_at: at("2026-10-05 06:00") });
     const touched = { ...fresh, first_touch_at: earlier, last_touch_at: earlier };
-    for (const id of offeredOutcomes(fresh)) {
+    for (const id of offeredIds(fresh)) {
       const contact = OUTCOMES.find((o) => o.id === id).contact;
       const p1 = applyOutcome(fresh, id, SAMPLE_ARGS[id], ctx).patch;
       const p2 = applyOutcome(touched, id, SAMPLE_ARGS[id], ctx).patch;
@@ -250,7 +256,7 @@ test("contact outcomes set last_touch_at / first_touch_at; the rest leave them a
 
 test("every outcome except snooze and seen clears unread_inbound_at and snoozed_until", () => {
   const job = jobIn("waiting_yes", { unread_inbound_at: at("2026-10-05 06:00"), snoozed_until: WED_0000 });
-  for (const id of offeredOutcomes(job)) {
+  for (const id of offeredIds(job)) {
     const { patch } = applyOutcome(job, id, SAMPLE_ARGS[id], ctx);
     const after = { ...job, ...patch };
     if (id === "seen") {
@@ -353,7 +359,7 @@ test("toasts and event summaries are exact (§5.5)", () => {
   assert.deepEqual(run(jobIn("scheduled", { quote_amount: 540 }), "done", {}), ["Marked done ($540).", "Done - $540"]);
   assert.deepEqual(run(jobIn("scheduled"), "done", {}), ["Marked done.", "Done"]);
   assert.deepEqual(run(jobIn("scheduled"), "another_visit", {}), ["Moved to Said yes - needs scheduling.", "Needs another visit"]);
-  assert.deepEqual(run(jobIn("quote"), "snooze", { snooze_until: "2026-10-07" }), ["Snoozed. Back on your list Wed.", "Snoozed until Wed"]);
+  assert.deepEqual(run(jobIn("quote"), "snooze", { snooze_until: "2026-10-07" }), ["OK, it'll be back on your list Wed.", "Put off until Wed"]);
   assert.deepEqual(run(jobIn("quote"), "lost", { lost_reason: "went_elsewhere" }), ["Moved to Lost.", "Lost - went with someone else"]);
   assert.deepEqual(run(jobIn("quote"), "lost", {}), ["Moved to Lost.", "Lost"]);
   assert.deepEqual(run(jobIn("new"), "not_a_job", {}), ["Removed - not a job.", "Not a job"]);
@@ -414,6 +420,48 @@ test("outcome effects (§5.2)", () => {
     kind: "outcome", summary: "Scheduled Tue with Mike",
     data: { outcome: "scheduled", from: "to_schedule", to: "scheduled", args: { visit_date: "2026-10-06", tech: "Mike" } },
   });
+});
+
+test("regression RT-2: 'Needs a quote for more work' closes the visit and opens a new quote job", () => {
+  const visit = jobIn("scheduled", { id: 10, customer_id: 9, quote_amount: 600, problem: "Prep table cooler fan grinding", equipment: "prep_table" });
+  const result = applyOutcome(visit, "need_quote", {}, ctx);
+  assert.deepEqual(pick({ ...visit, ...result.patch }, ["stage", "quote_amount", "won_at", "done_at", "next_due_at"]),
+    { stage: "done", quote_amount: 600, won_at: visit.won_at, done_at: A, next_due_at: null });
+  assert.equal(result.toast, "Marked done. The extra work is a new job waiting on your quote.");
+  assert.equal(result.event.summary, "Done - needs a quote for more work");
+  assert.deepEqual([result.event.data.from, result.event.data.to], ["scheduled", "done"]);
+  assert.deepEqual(result.spawn.event, { kind: "created", summary: "Extra work found at the Fri visit" });
+  const extra = result.spawn.job;
+  assert.deepEqual(pick(extra, ["customer_id", "stage", "source", "problem", "equipment", "created_at", "stage_entered_at", "next_due_at"]), {
+    customer_id: 9, stage: "quote", source: "manual", problem: "More work: Prep table cooler fan grinding",
+    equipment: "prep_table", created_at: A, stage_entered_at: A, next_due_at: TUE_0000,
+  });
+  assert.equal("won_at" in extra || "quote_amount" in extra, false, "the new quote isn't won and has no price yet");
+  assert.equal(applyOutcome(visit, "need_quote", {}, ctxAt(at("2026-10-14 09:00"))).spawn.event.summary,
+    "Extra work found at the Oct 2 visit");
+  assert.equal(applyOutcome(jobIn("scheduled", { problem: "x".repeat(70) }), "need_quote", {}, ctx).spawn.job.problem.length <= 60, true);
+  assert.equal("spawn" in applyOutcome(jobIn("new"), "need_quote", {}, ctx), false, "on a new lead it's still a talk");
+});
+
+test("askedForDay: the weekday a reply asks for, as the next such date after today", () => {
+  assert.equal(askedForDay("Can Mike come Wednesday instead of Tuesday? We're closed Tuesdays.", A, ctx.tz), "2026-10-07");
+  assert.equal(askedForDay("Not Tuesday - thursday works", A, ctx.tz), "2026-10-08");
+  assert.equal(askedForDay("monday is better for us", A, ctx.tz), "2026-10-12", "never today: next week's Monday");
+  assert.equal(askedForDay("We're closed Tuesdays", A, ctx.tz), null);
+  assert.equal(askedForDay("Thanks, see you then", A, ctx.tz), null);
+  assert.equal(askedForDay(null, A, ctx.tz), null);
+});
+
+test("UX-9: a reply asking for another day promotes 'Move to {Weekday}?' with that day preset", () => {
+  const reply = { unread_inbound_at: A, last_inbound: { at: A, channel: "sms", call_status: null, body: "Can Mike come Wednesday instead of Tuesday?" } };
+  const harbor = jobIn("scheduled", { visit_date: "2026-10-06", ...reply });
+  const buttons = outcomesFor(harbor, { ...ctx, suggestion: "move_day" });
+  assert.deepEqual(buttons[0], {
+    id: "scheduled", label: "Move to Wednesday?", primary: true, suggested: true, needs: "day", preset: { visit_date: "2026-10-07" },
+  });
+  assert.equal(buttons.filter((b) => b.id === "scheduled").length, 1);
+  assert.equal(promotionFor(harbor, "move_day"), "move_day");
+  assert.equal(promotionFor(jobIn("quote", reply), "move_day"), null, "only where 'Moved to another day' is offered");
 });
 
 test("moveStage: the Job detail stage picker (§5.7)", () => {

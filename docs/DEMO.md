@@ -1,5 +1,7 @@
 # 3-minute demo
 
+`npm run e2e` walks this script in headless Chrome and checks each step.
+
 **Setup.**
 - Run `npm start` and open <http://localhost:3000> in a phone-sized window (about 390×844), or on a phone.
 - Open **Demo controls**: tap the blue "Demo time" pill on Today. Press **Reset demo**.
@@ -40,14 +42,14 @@ Back on **Today**, tap the Bella Cucina card. Then tap **Booked it → Today →
 
 1. On **Rosa's Taqueria** ("Quote sent Thu, $2,400 - no answer in 4 days"), tap **Text**. A pre-written check-in opens in her own messaging app.
 2. In **Demo controls**, tap **Rosa texts "yes go ahead"**.
-3. Rosa jumps to **They got back to you** with her message and a **Mark as yes?** button. Tap **Mark as yes? → Thursday → Mike**.
+3. Rosa jumps to **They got back to you** with her message and a **Mark as yes?** button. Tap **Mark as yes? → Thursday → Mike**. Thursday is already highlighted, because it's the day she named.
 
 *"Texts go from her own number, so customers already know it. When the customer says yes, it's one tap. The app suggests it but never decides."*
 
 ## 1:55. Every channel lands on the same list
 
 1. **Demo controls → Web form: Tony's Bistro.** This is a Postmark-style email from her website form, run through the real webhook. It appears under **Urgent** labelled *Web form*. Sending it again is ignored as a duplicate.
-2. **+ New.** Paste `Dave's Deli 312-555-0193 reach-in not cooling, wants someone today`. Who, phone and problem fill in, along with *Reach-in* and **URGENT** (*"Read without AI"*). Tap **Add to my list**.
+2. **+ New.** Paste `Dave's Deli 312-555-0193 reach-in not cooling, wants someone today`. Who, phone and problem fill in, along with *Reach-in* and **URGENT** (*"Filled in for you - check it"*). Tap **Add to my list**.
 3. Mention **Brain dump** ("Adding a bunch from your notebook?"): day one, her notebook moves in one line per job.
 
 *"The website form becomes automatic with one Gmail forwarding rule. Texts and calls she catches go in with one paste or dictation. Texts and missed calls can be fully automatic with a Twilio number. Those adapters are built, and they're what the simulator drives."*
@@ -74,7 +76,9 @@ Show the terminal's startup line: `AI: rules only … | SMS: simulated (outbox)`
   - *Voicemail: Westside Diner*: becomes a new urgent job with its transcript.
   - *You forward Midway Meats' text*: Denise forwards a customer's text from her own phone, and it attaches to that customer's open job.
   - *Answered call, 8 seconds*: ignored as too short to be a job. *Answered call, 2 minutes* becomes "what was it about?".
+- **Harbor Grill** asks to move Tuesday's visit to Wednesday: its sheet leads with **Move to Wednesday?**.
+- **+ New** with a regular's text (paste Rosa's `Hi Denise its Rosa, the walk in is making that noise again 312-555-0118`): it asks whether this belongs to her open job (**Add this to that job**) or is **a new job**.
 - **Not today** hides a job until the day you pick, but the "hasn't heard from us" counter keeps running.
 - **Job detail:** edit any field inline (it saves when you leave the field), change stage, **Text a tech** (pre-written details to Luis/Mike/Dee/Sam), or **Bring back** a closed job.
 - **Settings:** your name, techs, morning text time, the husband's read-only link (`/n/…`), and the (off) auto-reply to new callers.
-- **AI parsing:** run `ANTHROPIC_API_KEY=… npm start`. Quick Add then shows **Read by AI**, and messy texts are read by Claude, with guardrails: anything not in the message is dropped, urgency can only go up, and it never sends or decides anything.
+- **AI parsing:** run `ANTHROPIC_API_KEY=… npm start`. Quick Add then shows **Filled in by AI - check it**, and messy texts are read by Claude, with guardrails: anything not in the message is dropped, urgency can only go up, and it never sends or decides anything.
