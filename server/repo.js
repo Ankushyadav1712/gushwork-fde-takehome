@@ -209,12 +209,16 @@ export function findCustomerByBusinessInText(db, text) {
 
 /**
  * §7.3 match order: phone, then email, then (forwarded texts only) business name in the text.
- * A phone that matches nobody marks a different person, so email is then not tried (C4).
+ * A phone that matches nobody marks a different person, so email is then not tried (C4), unless
+ * the email is the sender's own address (`emailIsSender`): a customer writing from it with a new
+ * number is still that customer.
  * Returns the customer row (blocked customers included; the caller decides) or null.
  */
-export function matchCustomer(db, { phone = null, email = null, text = null, forwarded = false } = {}) {
-  const byPhoneOrEmail = normalizePhone(phone) ? findCustomerByPhone(db, phone) : findCustomerByEmail(db, email);
-  return byPhoneOrEmail ?? (forwarded ? findCustomerByBusinessInText(db, text) : null);
+export function matchCustomer(db, { phone = null, email = null, text = null, forwarded = false, emailIsSender = false } = {}) {
+  const hasPhone = normalizePhone(phone) != null;
+  const byPhone = hasPhone ? findCustomerByPhone(db, phone) : null;
+  const byEmail = byPhone || (hasPhone && !emailIsSender) ? null : findCustomerByEmail(db, email);
+  return byPhone ?? byEmail ?? (forwarded ? findCustomerByBusinessInText(db, text) : null);
 }
 
 /** Customer fields normalised for storage: E.164 phone, one plain lowercased email (else null). */

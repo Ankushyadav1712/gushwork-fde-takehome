@@ -18,6 +18,8 @@ import {
 } from "../shared/time.js";
 
 const TICK_MINUTES = 5;
+/** Denise's own address in the demo, so her emails are never taken for a customer's (§7.3). */
+const DEMO_OWNER_EMAIL = "denise@frostline.example";
 /** The scheduler replay starts on the Friday before the anchor, at noon (§12.1). */
 const TICKS_FROM = { days: -3, hm: "12:00" };
 
@@ -303,7 +305,8 @@ function runStep(db, step, state) {
  * @returns {{anchor, jobs: number, texts: number}}
  */
 export function seedDemo(db, { anchor, env = process.env, publicUrl = resolvePublicUrl(env), setClock = true } = {}) {
-  const base = ensureSettings(db, env.BUSINESS_TZ ? { timezone: env.BUSINESS_TZ } : {});
+  ensureSettings(db, env.BUSINESS_TZ ? { timezone: env.BUSINESS_TZ } : {});
+  const base = putSettings(db, { owner_email: DEMO_OWNER_EMAIL });
   const tz = base.timezone || DEFAULT_TZ;
   const at = anchor ?? mostRecentMonday0700(new Date().toISOString(), tz);
   const settings = { ...base, auto_ack_enabled: false };

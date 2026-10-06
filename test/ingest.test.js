@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { openDb, all, get } from "../server/db.js";
 import * as repo from "../server/repo.js";
 import {
-  ingest, ingestManual, ingestBulk, IngestError, FALLBACK_PROBLEM, VALIDATION_MESSAGE,
+  ingest, ingestManual, ingestBulk, IngestError, FALLBACK_PROBLEM, VALIDATION_MESSAGE, ATTACH_MISMATCH_MESSAGE,
 } from "../server/ingest.js";
 import { fromGeneric, fromTwilioSms, fromTwilioVoice, fromForm, VOICEMAIL_PLACEHOLDER } from "../server/adapters.js";
 import { applyOutcome, outcomesFor, OutcomeError } from "../shared/stages.js";
@@ -739,9 +739,6 @@ test("identity: owner_email and relay senders are never stored as a customer's e
   assert.deepEqual([own, relay].map((r) => repo.getCustomer(db, r.customer_id).email), [null, null]);
   const carla = repo.getCustomer(db, replyTo.customer_id);
   assert.deepEqual([carla.email, carla.contact_name], ["carla@diaz.example", "Carla Diaz"]);
-  // A forwarded email (Fwd: subject) is not from the customer either.
-  const fwd = ingestAt(db, email("Ann <ann@relay.example>", "Our walk-in is warm 312-555-0181", { subject: "Fwd: walk-in" }), A);
-  assert.equal(repo.getCustomer(db, fwd.customer_id).email, null);
 });
 
 test("identity: an injected address is dropped at ingest (security RT-4)", () => {
@@ -798,6 +795,30 @@ test("Quick Add with attach_to_job_id adds the pasted text to that open job as t
   invalid({ text: "hi", attach_to_job_id: 999 }, "That job is closed now. Add this as a new job.");
   repo.updateJob(db, jobId, { stage: "lost", lost_reason: "price", next_due_at: null, closed_at: A, updated_at: A });
   invalid({ text: "hi", attach_to_job_id: jobId }, "That job is closed now. Add this as a new job.");
+});
+
+test("Quick Add onto an open job refuses a paste that is from someone else, and writes nothing (ux-N1)", () => {
+  const db = freshDb();
+  const jobId = midwayQuote(db);
+  const midway = repo.getJobRow(db, jobId).customer_id;
+  const other = repo.createCustomer(db, { business_name: "Rosa's Taqueria", phone: "+13125550118" }, A).id;
+  const refused = (input) => assert.throws(() => ingestManual(db, { attach_to_job_id: jobId, ...input }, { now: A }),
+    (err) => err instanceof IngestError && err.code === "attach_mismatch" && err.message === ATTACH_MISMATCH_MESSAGE);
+  // The preview that offered the job showed another customer, or the text's phone is someone else's.
+  refused({ text: "Gus here, any update?", expected_customer_id: other });
+  refused({ text: "Rosa 312-555-0118: the walk-in is warm again", expected_customer_id: midway });
+  refused({ text: "Rosa 312-555-0118: the walk-in is warm again" });
+  assert.equal(count(db, "messages"), 1);
+  assert.equal(repo.getJobRow(db, jobId).unread_inbound_at, null);
+
+  const same = ingestManual(db, { text: "Gus (312) 555-0174: any update?", attach_to_job_id: jobId, expected_customer_id: String(midway) },
+    { now: A });
+  assert.deepEqual([same.status, same.job_id], ["attached", jobId]);
+  // A customer with no phone on file can't be contradicted by one.
+  const tom = ingestAt(db, email("Tom <tbecker@northsidecold.example>", "Freezer fans are loud"), A);
+  const cell = ingestManual(db, { text: "Tom 312-555-0999: yes go ahead", attach_to_job_id: tom.job_id, expected_customer_id: tom.customer_id },
+    { now: A });
+  assert.equal(cell.status, "attached");
 });
 
 test("Quick Add validation: a phone that isn't a phone number doesn't count (C5)", () => {

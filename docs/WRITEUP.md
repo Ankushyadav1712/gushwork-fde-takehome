@@ -125,7 +125,7 @@ Every card has **Call** and **Text** buttons that use her own phone, and the tex
 | When | What happens |
 |---|---|
 | Day 0 | Deploy (~$5/mo server, HTTPS, passcode). Start Twilio A2P registration, which can take days to weeks. |
-| Day 1 (15 minutes with Denise) | Brain dump her notebook and open texts; add Callback to her home screen. Day one shows her real business. |
+| Day 1 (15 minutes with Denise) | Brain dump her notebook and open texts; add Callback to her home screen; put her email in Settings so her own forwards are never taken for a customer. Day one shows her real business. |
 | Day 2 | A Gmail filter forwards website-form emails, making the first channel automatic. |
 | Week 1 | A Twilio number for texts and a "New Job" contact; "forward when unanswered" for missed calls. |
 | Daily | The 7:00am text links straight to Today. Her husband has his read-only link. |

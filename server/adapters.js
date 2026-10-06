@@ -14,7 +14,9 @@ const GENERIC_CALL_STATUSES = new Set(["missed", "voicemail", "answered"]);
 const FORM_ID_KEYS = ["submissionid", "entryid", "id"];
 // Form-builder plumbing that is never part of the lead.
 const FORM_SKIPPED_KEY_RE = /^(?:token|utm|gclid|fbclid|formid|formname|pageurl|referr?er|g?recaptcha)/;
-const MAX_HTML = 100_000; // longer HTML bodies are cut before tag stripping
+const NAME_FIELDS = new Set(["contact_name", "first_name", "last_name"]);
+const MAX_HTML = 2_000_000; // HTML read per email; the tag scan is linear, this bounds its time
+const MAX_EMAIL_TEXT = 100_000; // longer email text is cut; raw_json keeps the whole message
 const MAX_MIME_DEPTH = 3;
 const MAILGUN_MAX_AGE_MS = 5 * 60_000;
 
@@ -24,6 +26,7 @@ const orNull = (v) => {
   const s = str(v).trim();
   return s ? s : null;
 };
+const isObject = (v) => v != null && typeof v === "object" && !Array.isArray(v);
 
 /** Every InboundEvent field (minus received_at), with defaults. Emails are kept only when strictly valid. */
 function makeEvent(fields) {
@@ -34,6 +37,7 @@ function makeEvent(fields) {
     from_phone: normalizePhone(fields.from_phone) ?? null,
     from_email: normalizeEmail(fields.from_email),
     from_name: orNull(fields.from_name),
+    from_reply_to: Boolean(fields.from_reply_to),
     subject: orNull(fields.subject),
     body: str(fields.body),
     call_status: fields.call_status ?? null,
@@ -48,6 +52,14 @@ function toSeconds(value) {
   const n = Number(value);
   return Number.isFinite(n) && n >= 0 ? Math.round(n) : null;
 }
+
+/** The text with a note line under it ("[photo attached]", "[2 attachments]"); the note alone when there is no text. */
+function withNote(text, note) {
+  if (!note) return text;
+  return text ? `${text}\n${note}` : note;
+}
+
+const attachmentNote = (count) => (count > 0 ? `[${count} attachment${count === 1 ? "" : "s"}]` : null);
 
 // ---------------------------------------------------------------------------
 // HTML to text
@@ -77,12 +89,12 @@ function tagText(name) {
 /**
  * Removes tags, comments and script/style/head blocks in one left-to-right pass. Every search
  * starts where the last one ended and an unclosed construct ends the text, so it stays linear
- * even on hostile input ("<a" repeated a million times).
+ * even on hostile input ("<a" repeated a million times). It stops once `maxText` characters are out.
  */
-function stripTags(html) {
+function stripTags(html, maxText) {
   let out = "";
   let i = 0;
-  while (i < html.length) {
+  while (i < html.length && out.length < maxText) {
     const lt = html.indexOf("<", i);
     if (lt === -1) return out + html.slice(i);
     out += html.slice(i, lt);
@@ -118,9 +130,12 @@ function stripTags(html) {
   return out;
 }
 
-/** Plain text from an HTML email body: block tags become line breaks, table cells tabs, entities are decoded. */
+/**
+ * Plain text from an HTML email body: block tags become line breaks, table cells tabs, entities are
+ * decoded. It reads up to MAX_HTML of HTML (a long <head><style> included) and keeps MAX_EMAIL_TEXT of text.
+ */
 export function htmlToText(html) {
-  return decodeEntities(stripTags(str(html).slice(0, MAX_HTML)))
+  return decodeEntities(stripTags(str(html).slice(0, MAX_HTML), MAX_EMAIL_TEXT).slice(0, MAX_EMAIL_TEXT))
     .replace(/\r\n?/g, "\n")
     .split("\n")
     .map((line) => line.replace(/[  ]+/g, " ").replace(/ ?\t[\s]*/g, "\t").trim())
@@ -157,17 +172,20 @@ function parseAddress(value) {
   return { name: null, email: bare ? bare[0] : null };
 }
 
-/** The address to answer: Reply-To when it holds an address (form mailers set it to the customer), else From. */
-function replyAddress(from, replyTo) {
+/**
+ * One email as an InboundEvent. The sender is Reply-To when it holds an address (form mailers set
+ * it to the customer), else From, and from_reply_to says which. The text is cut at MAX_EMAIL_TEXT
+ * and notes how many attachments came with it.
+ */
+function emailEvent({ provider, text, from, replyTo, subject, messageId, attachments = 0, raw }) {
   const reply = parseAddress(replyTo);
-  return normalizeEmail(reply.email) ? reply : from;
-}
-
-function emailEvent({ provider, text, from, subject, messageId, raw }) {
+  const replied = normalizeEmail(reply.email) != null;
+  const sender = replied ? reply : from;
+  const body = withNote(text.slice(0, MAX_EMAIL_TEXT), attachmentNote(attachments));
   return makeEvent({
-    channel: looksLikeForm(text) ? "form" : "email", provider,
+    channel: looksLikeForm(body) ? "form" : "email", provider,
     external_id: cleanMessageId(messageId),
-    from_email: from.email, from_name: from.name, subject, body: text, raw,
+    from_email: sender.email, from_name: sender.name, from_reply_to: replied, subject, body, raw,
   });
 }
 
@@ -182,7 +200,7 @@ export function fromTwilioSms(p) {
     channel: "sms", provider: "twilio",
     external_id: p.MessageSid ?? p.SmsMessageSid ?? p.SmsSid,
     from_phone: p.From,
-    body: media ? (text ? `${text}\n${PHOTO_NOTE}` : PHOTO_NOTE) : text,
+    body: withNote(text, media ? PHOTO_NOTE : null),
     raw: p,
   });
 }
@@ -241,20 +259,34 @@ function headerValue(headers, name) {
   return hit ? hit.Value : null;
 }
 
-/** Postmark inbound JSON: FromFull{Email,Name}, From, ReplyTo, Subject, TextBody, HtmlBody, MessageID, Headers[]. */
+/** Postmark's payload as stored: each attachment keeps its name, type and size, not its base64 contents. */
+function postmarkRaw(p) {
+  if (!Array.isArray(p.Attachments)) return p;
+  const Attachments = p.Attachments.map((a) => ({
+    Name: a?.Name ?? null, ContentType: a?.ContentType ?? null, ContentLength: a?.ContentLength ?? null,
+  }));
+  return { ...p, Attachments };
+}
+
+/** Postmark inbound JSON: FromFull{Email,Name}, From, ReplyTo, Subject, TextBody, HtmlBody, MessageID, Headers[], Attachments[]. */
 export function fromPostmark(p) {
   const from = p.FromFull?.Email ? { email: p.FromFull.Email, name: orNull(p.FromFull.Name) } : parseAddress(p.From);
   return emailEvent({
     provider: "postmark",
     text: orNull(p.TextBody) ? str(p.TextBody).trim() : htmlToText(p.HtmlBody),
-    from: replyAddress(from, p.ReplyTo ?? headerValue(p.Headers, "reply-to")),
+    from,
+    replyTo: p.ReplyTo ?? headerValue(p.Headers, "reply-to"),
     subject: p.Subject,
     messageId: headerValue(p.Headers, "message-id") ?? p.MessageID,
-    raw: p,
+    attachments: Array.isArray(p.Attachments) ? p.Attachments.length : 0,
+    raw: postmarkRaw(p),
   });
 }
 
-/** Mailgun inbound route (urlencoded): sender, from, Reply-To, subject, body-plain, stripped-text, Message-Id. */
+/**
+ * Mailgun inbound route (urlencoded, or multipart with attachments): sender, from, Reply-To, subject,
+ * body-plain, stripped-text, Message-Id, and attachment-N file parts.
+ */
 export function fromMailgun(p) {
   const parsed = parseAddress(p.from ?? p.From);
   const from = parsed.email ? parsed : { name: parsed.name, email: orNull(p.sender) };
@@ -262,9 +294,11 @@ export function fromMailgun(p) {
   return emailEvent({
     provider: "mailgun",
     text: text ?? htmlToText(p["body-html"] ?? p["stripped-html"]),
-    from: replyAddress(from, p["Reply-To"] ?? p["reply-to"]),
+    from,
+    replyTo: p["Reply-To"] ?? p["reply-to"],
     subject: p.subject ?? p.Subject,
     messageId: p["Message-Id"] ?? p["message-id"] ?? p["Message-ID"],
+    attachments: Object.values(p).filter(isFilePart).length,
     raw: p,
   });
 }
@@ -388,6 +422,19 @@ function decodeMultipart(body, boundary, depth) {
   return chosen ? decodeBody(chosen.body, chosen.headers, depth + 1) : "";
 }
 
+// RFC 2047 encoded words: "=?UTF-8?B?Sm9zw6k=?=" (base64) or "=?UTF-8?Q?Caf=C3=A9?=" (quoted-printable).
+const ENCODED_WORD_RE = /=\?([^?\s]+)\?([BQ])\?([^?\s]*)\?=/gi;
+
+/** A raw header value with its encoded words decoded; the space between two encoded words is dropped. */
+function decodeHeader(value) {
+  return str(value)
+    .replace(/\?=\s+(?==\?)/g, "?=")
+    .replace(ENCODED_WORD_RE, (all, charset, encoding, text) => {
+      const bytes = encoding.toUpperCase() === "B" ? Buffer.from(text, "base64") : decodeQuotedPrintable(text.replace(/_/g, " "));
+      return decodeCharset(bytes, charset.replace(/\*.*$/, "")); // "UTF-8*en" names a language too
+    });
+}
+
 /** A raw text/plain or message/rfc822 email: headers (From, Reply-To, Subject, Message-ID) until a blank line, then the body. */
 export function fromRawEmail(rawText) {
   const text = str(rawText).replace(/\r\n?/g, "\n");
@@ -396,20 +443,64 @@ export function fromRawEmail(rawText) {
   return emailEvent({
     provider: "raw",
     text: split ? decodeBody(split.body, headers) : text.trim(),
-    from: replyAddress(parseAddress(headers.from), headers["reply-to"]),
-    subject: headers.subject,
+    from: parseAddress(decodeHeader(headers.from)),
+    replyTo: decodeHeader(headers["reply-to"]),
+    subject: decodeHeader(headers.subject),
     messageId: headers["message-id"],
     raw: str(rawText),
   });
 }
 
 // ---------------------------------------------------------------------------
+// multipart/form-data bodies (Mailgun posts with attachments, some form builders)
+
+/** A file part as decodeFormData keeps it: {filename, type, size}, without its contents. */
+function isFilePart(value) {
+  return isObject(value) && typeof value.filename === "string" && Number.isInteger(value.size);
+}
+
+/** The part without the line break that ends it (the one before the next boundary). */
+function withoutFinalBreak(part) {
+  if (part.endsWith("\r\n")) return part.slice(0, -2);
+  return part.endsWith("\n") ? part.slice(0, -1) : part;
+}
+
+/**
+ * A multipart/form-data body as a plain object: each text part under its name (the first one
+ * wins), and each file part as {filename, type, size}; file contents are never kept.
+ */
+export function decodeFormData(buffer, contentTypeHeader) {
+  const fields = {};
+  const { boundary } = contentType(contentTypeHeader).params;
+  if (!boundary || !Buffer.isBuffer(buffer)) return fields;
+  const utf8 = (s) => Buffer.from(s, "latin1").toString("utf8");
+  // latin1 keeps one character per byte, so a file part's length is its size.
+  for (const part of buffer.toString("latin1").split(`--${boundary}`).slice(1)) {
+    if (part.startsWith("--")) break; // the closing delimiter
+    const gap = /\r?\n\r?\n/.exec(part);
+    if (!gap) continue;
+    const head = part.slice(0, gap.index);
+    const disposition = /^content-disposition:(.*)$/im.exec(head)?.[1] ?? "";
+    const name = /\bname="([^"]*)"/i.exec(disposition)?.[1];
+    if (!name) continue;
+    const body = withoutFinalBreak(part.slice(gap.index + gap[0].length));
+    const filename = /\bfilename="([^"]*)"/i.exec(disposition)?.[1];
+    const type = /^content-type:\s*([^\s;]+)/im.exec(head)?.[1] ?? null;
+    fields[utf8(name)] ??= filename == null ? utf8(body) : { filename: utf8(filename), type, size: body.length };
+  }
+  return fields;
+}
+
+// ---------------------------------------------------------------------------
 // Website forms
 
-/** A field's value as one line of text: lists and objects ({street, city}) are joined with ", ". */
-function fieldText(value) {
+/**
+ * A field's value as one line of text: lists and objects ({street, city}) are joined with ", ",
+ * or with `separator` (a split name, {first, last}, is joined with a space).
+ */
+function fieldText(value, separator = ", ") {
   if (value == null) return "";
-  if (typeof value === "object") return Object.values(value).map(fieldText).filter(Boolean).join(", ");
+  if (typeof value === "object") return Object.values(value).map((v) => fieldText(v, separator)).filter(Boolean).join(separator);
   return String(value).trim();
 }
 
@@ -418,7 +509,7 @@ function formEntries(payload) {
   const entries = [];
   for (const [rawKey, value] of Object.entries(payload)) {
     const key = /\[([^\]]+)\]$/.exec(rawKey)?.[1] ?? rawKey;
-    const nested = value && typeof value === "object" && !Array.isArray(value) && !formFieldFor(key);
+    const nested = isObject(value) && !isFilePart(value) && !formFieldFor(key);
     if (nested) entries.push(...Object.entries(value));
     else entries.push([key, value]);
   }
@@ -432,9 +523,10 @@ function messageFromExtras(extras) {
 }
 
 /**
- * A direct website-form webhook (JSON or urlencoded). Fields the parser knows (shared/parse.js
- * label names) become form_fields; message-like fields become the body; unknown fields are
- * appended as "Key: value"; ids and tracking fields are dropped.
+ * A direct website-form webhook (JSON, urlencoded or multipart). Fields the parser knows
+ * (shared/parse.js label names) become form_fields; message-like fields become the body; unknown
+ * fields are appended as "Key: value"; uploaded files are counted in a note; ids and tracking
+ * fields are dropped.
  */
 export function fromForm(p) {
   const payload = p && typeof p === "object" ? p : { message: str(p) };
@@ -442,12 +534,17 @@ export function fromForm(p) {
   const messages = [];
   const extras = [];
   let externalId = null;
+  let files = 0;
   for (const [key, value] of formEntries(payload)) {
+    if (isFilePart(value)) {
+      files += 1;
+      continue;
+    }
     const k = keyOf(key);
-    const text = fieldText(value);
+    const field = formFieldFor(key);
+    const text = fieldText(value, NAME_FIELDS.has(field) ? " " : ", ");
     if (FORM_ID_KEYS.includes(k)) externalId ??= orNull(text);
     if (FORM_ID_KEYS.includes(k) || FORM_SKIPPED_KEY_RE.test(k) || !text) continue;
-    const field = formFieldFor(key);
     if (field === "message") messages.push(text);
     else if (field) known[field] ??= text;
     else extras.push({ key, text });
@@ -456,11 +553,12 @@ export function fromForm(p) {
   if (standIn) messages.push(standIn.text);
   if (messages.length) known.message = messages.join("\n");
   const name = known.contact_name ?? ([known.first_name, known.last_name].filter(Boolean).join(" ") || null);
+  const lines = [...messages, ...extras.filter((e) => e !== standIn).map((e) => `${e.key}: ${e.text}`)];
   return makeEvent({
     channel: "form", provider: "form",
     external_id: externalId,
     from_phone: known.phone, from_email: known.email, from_name: name,
-    body: [...messages, ...extras.filter((e) => e !== standIn).map((e) => `${e.key}: ${e.text}`)].join("\n"),
+    body: withNote(lines.join("\n"), attachmentNote(files)),
     form_fields: Object.keys(known).length ? known : null,
     raw: p,
   });
@@ -491,9 +589,12 @@ function genericEmail(p) {
   return emailEvent({
     provider: "generic",
     text: orNull(p.text) ? str(p.text).trim() : htmlToText(p.html),
-    from: replyAddress({ email: from.email, name: orNull(p.from_name) ?? from.name }, p.reply_to),
+    from: { email: from.email, name: orNull(p.from_name) ?? from.name },
+    replyTo: p.reply_to,
     subject: p.subject,
-    messageId: p.message_id, raw: p,
+    messageId: p.message_id,
+    attachments: Object.values(p).filter(isFilePart).length, // a multipart post in this shape (SendGrid's) can carry files
+    raw: p,
   });
 }
 

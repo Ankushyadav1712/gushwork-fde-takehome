@@ -118,7 +118,7 @@ export function SettingsScreen() {
       <${TextSetting} label="Company" name="company_name" value=${s.company_name} onSave=${save} />
       <${TextSetting} label="Your cell" name="owner_phone" type="tel" value=${phoneDisplay(s.owner_phone) || s.owner_phone} onSave=${save} />
       <${TextSetting} label="Your email" name="owner_email" type="email" value=${s.owner_email} onSave=${save}
-        hint="So emails you forward aren't mistaken for a customer." />
+        hint="So emails you send or forward aren't mistaken for a customer's." />
     </section>
 
     <section class="panel" aria-labelledby="techs-h">

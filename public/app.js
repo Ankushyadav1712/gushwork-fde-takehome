@@ -49,7 +49,7 @@ function screenFor({ path, params }) {
   const job = /^\/job\/(\d+)$/.exec(path);
   if (job) return html`<${JobScreen} id=${Number(job[1])} />`;
   switch (path) {
-    case "/jobs": return html`<${JobsScreen} stage=${params.get("stage") || "open"} />`;
+    case "/jobs": return html`<${JobsScreen} stage=${params.get("stage") || "open"} day=${params.get("day")} />`;
     case "/new": return html`<${NewScreen} />`;
     case "/new/bulk": return html`<${BulkScreen} />`;
     case "/numbers": return html`<${NumbersScreen} />`;

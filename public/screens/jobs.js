@@ -2,6 +2,7 @@
 import { html, useState, useEffect } from "/vendor/preact-htm.js";
 import * as api from "../api.js";
 import { pluralWord } from "/shared/format.js";
+import { localDate } from "/shared/time.js";
 import { STAGES, OPEN_STAGES, stageShort } from "/shared/stages.js";
 import { useApp, useAsync, ErrorState, Loading, PageHeader } from "../ui/common.js";
 import { JobRow, isPutOff } from "../ui/job-info.js";
@@ -11,6 +12,8 @@ const SEARCH_DEBOUNCE_MS = 250;
 
 // "later" (put off till later) is filtered here from the open list; the others are server filters.
 const PUT_OFF = "later";
+// `day=today` (Today's "Scheduled today" link) keeps only today's visits, also filtered here.
+const VISITS_TODAY = "today";
 const FILTERS = [
   { id: "open", label: "All open" },
   ...OPEN_STAGES.map((id) => ({ id, label: stageShort(id) })),
@@ -52,16 +55,19 @@ function FilterChips({ active, counts }) {
   </nav>`;
 }
 
-export function JobsScreen({ stage }) {
+export function JobsScreen({ stage, day = null }) {
   const app = useApp();
   const [q, setQ] = useState("");
   const query = useDebounced(q.trim(), SEARCH_DEBOUNCE_MS);
+  const visitsToday = day === VISITS_TODAY;
   const { data, error, loading, reload } = useAsync(async () => {
     const putOff = stage === PUT_OFF;
     const res = await api.getJobs({ stage: putOff ? "open" : stage, q: query });
     app.setServerNow(res?.now);
-    return putOff ? { ...res, jobs: res.jobs.filter((j) => isPutOff(j, res.now)) } : res;
-  }, [stage, query]);
+    if (putOff) return { ...res, jobs: res.jobs.filter((j) => isPutOff(j, res.now)) };
+    if (visitsToday) return { ...res, jobs: res.jobs.filter((j) => j.visit_date === localDate(res.now, app.tz)) };
+    return res;
+  }, [stage, query, visitsToday]);
   useEffect(() => { if (app.version) reload({ quiet: true }); }, [app.version]);
 
   const total = openTotal(data?.counts);
@@ -71,7 +77,8 @@ export function JobsScreen({ stage }) {
   const list = () => {
     if (!data) return error ? html`<${ErrorState} error=${error} onRetry=${reload} />` : html`<${Loading} />`;
     if (!data.jobs.length) {
-      return html`<p class="empty-note">${query ? `Nothing matches "${query}".` : "No jobs here right now."}</p>`;
+      const none = visitsToday ? "No visits today." : "No jobs here right now.";
+      return html`<p class="empty-note">${query ? `Nothing matches "${query}".` : none}</p>`;
     }
     if (!grouped) {
       return html`<ul class="job-list">${data.jobs.map((j) => html`<${JobRow} key=${j.id} job=${j} nowIso=${now} tz=${app.tz} />`)}</ul>`;
@@ -89,6 +96,7 @@ export function JobsScreen({ stage }) {
       <a class="icon-btn" href="#/settings" aria-label="Settings"><${Icon} name="gear" /></a>
     </${PageHeader}>
     <${FilterChips} active=${stage} counts=${data?.counts} />
+    ${visitsToday && html`<p class="filter-note">Only visits today · <a href=${`#/jobs?stage=${stage}`}>Show all</a></p>`}
     <div class="search">
       <label class="visually-hidden" for="job-search">Search name, business or phone</label>
       <${Icon} name="search" size=${20} className="search-icon" />

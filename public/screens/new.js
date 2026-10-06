@@ -53,10 +53,13 @@ function useLiveParse(text, app) {
     if (!trimmed) { setLocal(null); setServer(null); setReading(false); return undefined; }
     const t = setTimeout(() => {
       const s = app.settings || {};
-      setLocal(normaliseParse(parseMessage(trimmed, {
-        channel: "manual", owner_phone: s.owner_phone, owner_email: s.owner_email, techs: s.techs || [],
-        now: app.nowIso(), tz: app.tz,
-      })));
+      setLocal({
+        text: trimmed,
+        parse: normaliseParse(parseMessage(trimmed, {
+          channel: "manual", owner_phone: s.owner_phone, owner_email: s.owner_email, techs: s.techs || [],
+          now: app.nowIso(), tz: app.tz,
+        })),
+      });
     }, PREVIEW_DEBOUNCE_MS);
     return () => clearTimeout(t);
   }, [text]);
@@ -69,14 +72,20 @@ function useLiveParse(text, app) {
     const t = setTimeout(async () => {
       try {
         const res = await api.parseText(trimmed, true);
-        if (mine === seq.current) setServer(normaliseParse(res));
+        if (mine === seq.current) setServer({ text: trimmed, parse: normaliseParse(res) });
       } catch { /* the local preview stays; the badge falls back to "Filled in for you" */ }
       if (mine === seq.current) setReading(false);
     }, SERVER_DEBOUNCE_MS);
     return () => clearTimeout(t);
   }, [text]);
 
-  return { parse: server || local, reading, mode: server?.mode || (local ? "rules" : null) };
+  // A server parse of earlier text is dropped at once: its matched customer (and open-job banner)
+  // belongs to that text, not this one. The local preview stands in until the new one is back.
+  // Until either parse is of this text (`pending`, up to 300 ms), the fields shown are the old text's.
+  const trimmed = text.trim();
+  const fresh = server?.text === trimmed ? server.parse : null;
+  const pending = Boolean(trimmed) && !fresh && local?.text !== trimmed;
+  return { parse: fresh || local?.parse || null, reading, pending, mode: fresh?.mode || (local ? "rules" : null) };
 }
 
 function ReadBadge({ reading, mode }) {
@@ -121,6 +130,7 @@ function CustomerBanner({ customer, asking, busy, onAttach, onNewJob }) {
 
 /** Copy for a failed save: the form's own problems, else a retry, else the offline line. */
 function saveErrorText(err) {
+  if (err.code === "attach_mismatch") return err.message;
   if (err.status === 400) return "Add a name, a phone number, or what's wrong.";
   if (err.status === 422) return "That stage needs a bit more. Tap it to fill in the details.";
   return err.status === 0 ? ERROR_COPY : "That didn't save. Please try again.";
@@ -159,7 +169,7 @@ export function NewScreen() {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [newJobFor, setNewJobFor] = useState(null);
-  const { parse, reading, mode } = useLiveParse(text, app);
+  const { parse, reading, pending, mode } = useLiveParse(text, app);
 
   const fields = parse?.fields || {};
   const whoParsed = fields.business_name || fields.contact_name || "";
@@ -209,6 +219,8 @@ export function NewScreen() {
       location.hash = "#/";
     } catch (err) {
       setBusy(false);
+      // The text isn't from the open job's customer (attach_mismatch): offer it as a new job instead.
+      if (err.code === "attach_mismatch") setNewJobFor(openJob.id);
       if (err.status !== 401) setError(saveErrorText(err));
     }
   }
@@ -234,7 +246,7 @@ export function NewScreen() {
     });
   }
 
-  const attach = () => save({ attach_to_job_id: openJob.id });
+  const attach = () => save({ attach_to_job_id: openJob.id, expected_customer_id: customer.id });
 
   function pickerDone(picked) {
     const thenAdd = picker?.thenAdd;
@@ -254,7 +266,7 @@ export function NewScreen() {
         <h2 id="preview-h" class="panel-title">Check the details</h2>
         <${ReadBadge} reading=${reading} mode=${mode} />
       </div>
-      ${customer && html`<${CustomerBanner} customer=${customer} asking=${askAttach} busy=${busy}
+      ${customer && html`<${CustomerBanner} customer=${customer} asking=${askAttach} busy=${busy || reading}
         onAttach=${attach} onNewJob=${() => setNewJobFor(openJob.id)} />`}
       <div class="field">
         <label class="field-label" for="q-who">Who</label>
@@ -284,7 +296,7 @@ export function NewScreen() {
     </section>`}
 
     ${error && html`<p class="inline-error" role="alert">${error}</p>`}
-    ${!(showPreview && askAttach) && html`<button type="button" class="btn btn-primary btn-block" disabled=${busy}
+    ${!(showPreview && askAttach) && html`<button type="button" class="btn btn-primary btn-block" disabled=${busy || pending}
       onClick=${() => add()}>Add to my list</button>`}
     <p class="center-link"><a href="#/new/bulk">Adding a bunch from your notebook? Paste one per line</a></p>
     ${picker && html`<${StagePickerSheet} stage=${picker.stage} onClose=${() => setPicker(null)} onDone=${pickerDone} />`}

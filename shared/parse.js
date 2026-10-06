@@ -59,9 +59,10 @@ const capitalize = (s) => (s ? s[0].toUpperCase() + s.slice(1) : s);
 const PHONE_SRC = String.raw`(?<!\d)(?:\+?1[\s.-]?)?\(?[2-9]\d{2}\)?[\s.-]?\d{3}[\s.-]?\d{4}\b`;
 // A seven-digit local number is never the customer's phone (§8.6), but it is still not a problem.
 const LOCAL_PHONE_SRC = String.raw`(?<![\d-])\d{3}[-.]\d{4}(?![\d-])`;
-const EMAIL_CORE = String.raw`[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}`;
+// Local parts may hold an apostrophe (sean.o'brien@...); mailtoHref encodes it.
+const EMAIL_CORE = String.raw`[A-Za-z0-9._%+'-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}`;
 // The lookbehind makes a match start only at a token boundary, keeping long inputs linear.
-const EMAIL_SRC = String.raw`(?<![A-Za-z0-9._%+-])${EMAIL_CORE}`;
+const EMAIL_SRC = String.raw`(?<![A-Za-z0-9._%+'-])${EMAIL_CORE}`;
 const EMAIL_ONLY_RE = new RegExp(`^${EMAIL_CORE}$`);
 const MAX_EMAIL_LENGTH = 254;
 const URL_SRC = String.raw`\b(?:https?:\/\/|www\.)\S+`;
@@ -73,7 +74,12 @@ export function normalizeEmail(value) {
 }
 
 const RELAY_LOCAL_RE = /^(?:no-?reply|do-?not-?reply|mailer-daemon|postmaster|wordpress|forms?|notifications?|submissions?)(?![a-z0-9])/;
-const FORM_SERVICE_RE = /(?:^|[.-])(?:wix|squarespace|jotform|wufoo|typeform|formspree|hubspot)[a-z]*(?=[.-]|$)/;
+// Website-form services: these domains and their subdomains (crm.wix.com), never a lookalike (wixomgrill.example).
+const FORM_SERVICE_DOMAINS = [
+  "wix.com", "wixsite.com", "squarespace.com", "squarespace.info", "jotform.com", "wufoo.com", "typeform.com",
+  "formspree.io", "hubspot.com", "hubspotemail.net",
+];
+const isFormServiceDomain = (domain) => FORM_SERVICE_DOMAINS.some((d) => domain === d || domain.endsWith(`.${d}`));
 
 /**
  * True for an address that speaks for someone else, so it is never a customer's identity:
@@ -84,7 +90,7 @@ export function isRelayAddress(email, ownerEmail = null) {
   if (!address) return false;
   if (address === normalizeEmail(ownerEmail)) return true;
   const [local, domain] = address.split("@");
-  return RELAY_LOCAL_RE.test(local) || FORM_SERVICE_RE.test(domain);
+  return RELAY_LOCAL_RE.test(local) || isFormServiceDomain(domain);
 }
 
 function findPhones(text) {
@@ -98,14 +104,19 @@ function firstCustomerPhone(text, excluded) {
 
 // Header lines quoted inside a body ("From: Frostline Website <forms@...>") name mailers, not customers.
 const ADDRESS_HEADER_LINE_RE = /^[\s>*]*(?:from|sender|reply-to|to|cc|bcc)\*?\s*:/i;
+const FROM_HEADER_LINE_RE = /^[\s>*]*from\*?\s*:/i;
+
+/** The plain addresses in one line, in order. A leading ' is a quote mark ('ann@x.example'), not part of one. */
+function emailsIn(line) {
+  return [...line.matchAll(new RegExp(EMAIL_SRC, "g"))].map((m) => normalizeEmail(m[0].replace(/^'+/, ""))).filter(Boolean);
+}
 
 /** First customer email in the text: header lines and relay addresses are skipped. */
 function firstEmail(text, ownerEmail) {
   for (const line of text.split("\n")) {
     if (ADDRESS_HEADER_LINE_RE.test(line)) continue;
-    for (const m of line.matchAll(new RegExp(EMAIL_SRC, "g"))) {
-      if (!isRelayAddress(m[0], ownerEmail)) return m[0].toLowerCase();
-    }
+    const email = emailsIn(line).find((e) => !isRelayAddress(e, ownerEmail));
+    if (email) return email;
   }
   return null;
 }
@@ -321,6 +332,8 @@ function readForward(text, ownerPhone) {
   }
   let phone = null;
   let name = null;
+  let email = null;
+  let fromLineSeen = false;
   const lines = [];
   for (const line of s.split("\n")) {
     if (FORWARD_MARKER_RE.test(line)) {
@@ -336,17 +349,22 @@ function readForward(text, ownerPhone) {
       if (m[3].trim()) lines.push(m[3]);
       continue;
     }
+    // A forwarded email's own "From: Ann Chef <ann@...>" line; the line stays for its display name.
+    if (forwarded && !fromLineSeen && FROM_HEADER_LINE_RE.test(line)) {
+      fromLineSeen = true;
+      email = emailsIn(line)[0] ?? null;
+    }
     lines.push(line);
   }
-  return { body: lines.join("\n").trim(), phone, name, forwarded };
+  return { body: lines.join("\n").trim(), phone, name, email, forwarded };
 }
 
 /**
- * Strips forwarding wrappers and captures the original sender.
- * @returns {{body: string, phone: string|null, name: string|null, forwarded: boolean}}
+ * Strips forwarding wrappers and captures the original sender (a forwarded email's From address too).
+ * @returns {{body: string, phone: string|null, name: string|null, email: string|null, forwarded: boolean}}
  */
 export const unwrapForward = guard("unwrapForward", readForward,
-  (text) => ({ body: normalizeText(text).trim(), phone: null, name: null, forwarded: false }));
+  (text) => ({ body: normalizeText(text).trim(), phone: null, name: null, email: null, forwarded: false }));
 
 // ---------------------------------------------------------------------------
 // Form labels and email headers
@@ -460,7 +478,7 @@ function joinName(first, last) {
 const SIGN_OFF_RE = /^(?:thanks|thank you|thx|ty|cheers|regards|best regards|best|sincerely|appreciate it)\b[\s,!.]*$/i;
 const SIGNATURE_LINE_RE = new RegExp(String.raw`^\s*[-–—~]\s*(${NAME})\s*(?:,\s*(${BIZ}))?\s*$`, "u");
 const SIGN_OFF_NAME_RE = new RegExp(String.raw`^\s*(?:thanks|thank you|thx|cheers|regards|best)[,!.]?\s+(${NAME})[.!]?\s*$`, "iu");
-const NOISE_LINE_RE = /^\s*(?:sent from my .*|\[photo attached\]|\(voicemail - no transcript yet\))\s*$/i;
+const NOISE_LINE_RE = /^\s*(?:sent from my .*|\[photo attached\]|\[\d+ attachments?\]|\(voicemail - no transcript yet\))\s*$/i;
 
 /** Removes signature blocks and noise lines; returns the content and any signed name. */
 function contentFrom(lines) {
@@ -685,10 +703,15 @@ function mergeFalseBreaks(parts) {
 const stripEndPunct = (s) => s.replace(/(?<![^\p{L}\p{N})\]%"'])[^\p{L}\p{N})\]%"']+$/u, "");
 const isSignOffSentence = (s) => SIGN_OFF_RE.test(s) || SIGN_OFF_NAME_RE.test(s) || /^-+$/.test(s);
 
-/** "Can you send someone?" asks for help without saying what for. */
-function isBareAsk(s) {
+/**
+ * A leading ask that gives way to a later sentence: a bare one ("Can you send someone?") to any,
+ * and one about the visit only ("Could you send someone out today?") to one that names the equipment.
+ */
+function isSkippableAsk(s, after) {
   const ask = LEADING_ASK_RE.exec(s);
-  return ask != null && wordCount(s.slice(ask[0].length)) < 3;
+  if (!ask) return false;
+  if (wordCount(s.slice(ask[0].length)) < 3) return after.meaningful;
+  return after.equipment && equipmentIn(s) == null;
 }
 
 /**
@@ -699,10 +722,11 @@ function summarize(content, { leadingRun: useRun, address, strip }) {
   const originals = splitSentences(content);
   const cleaned = originals.map((s) => collapse(removeContacts(address ? s.split(address).join(" ") : s)));
   const isMeaningful = (x) => x && !isSignOffSentence(x);
-  const moreAfter = []; // moreAfter[i]: a meaningful sentence follows sentence i
-  for (let i = cleaned.length - 1, seen = false; i >= 0; i--) {
-    moreAfter[i] = seen;
-    seen ||= Boolean(isMeaningful(cleaned[i]));
+  const after = []; // after[i]: whether a meaningful sentence, and one naming equipment, follow sentence i
+  for (let i = cleaned.length - 1, meaningful = false, equipment = false; i >= 0; i--) {
+    after[i] = { meaningful, equipment };
+    meaningful ||= Boolean(isMeaningful(cleaned[i]));
+    equipment ||= equipmentIn(cleaned[i]) != null;
   }
   for (let i = 0; i < cleaned.length; i++) {
     let s = stripGreeting(stripEndPunct(cleaned[i]));
@@ -713,10 +737,10 @@ function summarize(content, { leadingRun: useRun, address, strip }) {
       const afterComma = /^\s*,/.test(rest);
       rest = stripGreeting(rest.replace(/^[\s,:;.!–—-]+/, ""));
       if (!rest) continue;
-      if (intro.droppable && !afterComma && wordCount(rest) < 4 && moreAfter[i]) continue;
+      if (intro.droppable && !afterComma && wordCount(rest) < 4 && after[i].meaningful) continue;
       s = rest;
     }
-    if (isSignOffSentence(s) || (isBareAsk(s) && moreAfter[i])) continue;
+    if (isSignOffSentence(s) || isSkippableAsk(s, after[i])) continue;
     const problem = finishProblem(strip ? strip(s) : s);
     if (!problem) continue;
     const details = originals.slice(i + 1).filter(isMeaningful).join(" ");
@@ -967,7 +991,8 @@ function readMessage(text, opts) {
     contact_name: contact_name || null,
     business_name: business_name || null,
     phone: pickPhone({ channel, sender: normalizePhone(opts.from_phone), fwd, fields, body: fwd.body, excluded }),
-    email: firstEmail(fields.email ?? "", ownerEmail) ?? firstEmail(fwd.body, ownerEmail),
+    // The Email: field, then a forwarded email's original sender, then the first address in the text.
+    email: firstEmail(fields.email ?? "", ownerEmail) ?? firstEmail(fwd.email ?? "", ownerEmail) ?? firstEmail(fwd.body, ownerEmail),
     address,
     equipment,
     problem,

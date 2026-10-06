@@ -3,7 +3,7 @@
 // dropped: any failure after the raw insert still produces a placeholder job.
 import { tx } from "./db.js";
 import {
-  getSettings, matchCustomer, createCustomer, fillCustomerBlanks, getCustomer, findCustomerByPhone,
+  getSettings, matchCustomer, createCustomer, fillCustomerBlanks, getCustomer, findCustomerByPhone, findCustomerByEmail,
   updateCustomer, openJobsForCustomer, insertJob, getJobRow, updateJob, insertMessage, updateMessage,
   getMessage, findMessageByExternal, insertEvent, updateEventSummary, insertOutbox, countOutboxSince,
 } from "./repo.js";
@@ -20,6 +20,7 @@ export const FALLBACK_PROBLEM = "Couldn't read this one - tap to look";
 export const VALIDATION_MESSAGE = "Add a name, a phone number, or what's wrong.";
 const PASTE_FIRST_MESSAGE = "Paste their message first.";
 const CLOSED_JOB_MESSAGE = "That job is closed now. Add this as a new job.";
+export const ATTACH_MISMATCH_MESSAGE = "That text looks like it's from someone else. Add it as a new job instead.";
 
 const CHANNELS = ["call", "sms", "email", "form", "manual", "bulk"];
 const PROVIDERS = ["twilio", "postmark", "mailgun", "form", "generic", "raw", "app"];
@@ -91,6 +92,7 @@ function normalizeEvent(event, now) {
     from_phone: normalizePhone(event.from_phone) ?? null,
     from_email: normalizeEmail(event.from_email),
     from_name: event.from_name ?? null,
+    from_reply_to: Boolean(event.from_reply_to),
     subject: event.subject ?? null,
     body: event.body == null ? "" : String(event.body),
     call_status: CALL_DETAILS.includes(event.call_status) ? event.call_status : null,
@@ -161,18 +163,32 @@ function displayName(name) {
 // Customer identity (§7.3, C4)
 
 /**
- * A plain email's sender as the customer's email and name, or null when the address speaks for
- * someone else: a relay or form mailer, Denise's own address, a form notification (channel
- * 'form') or an email she forwarded. Those leads are known by the phone and email in the body.
+ * Until Denise sets her own address, a forwarded email from an address no customer has is taken
+ * as hers; a customer who forwards something to her stays its sender.
  */
-function emailSender(ev, ctx) {
-  if (ev.channel !== "email" || !ev.from_email) return null;
+function forwardedByOwner(db, ev, ctx) {
+  if (normalizeEmail(ctx.settings.owner_email)) return false; // set: isRelayAddress knows her address
   const forwarded = FORWARDED_SUBJECT_RE.test(ev.subject ?? "") || unwrapForward(ev.body).forwarded;
-  if (forwarded || isRelayAddress(ev.from_email, ctx.settings.owner_email)) return null;
-  return { email: ev.from_email, name: displayName(ev.from_name) };
+  return forwarded && !findCustomerByEmail(db, ev.from_email);
 }
 
-/** Customer identity and fields from a parse; a plain email's sender supplies the email and a missing name. */
+/**
+ * An email's sender as the customer's {email, name, direct}, or null when the address speaks for
+ * someone else: a relay or form mailer, or Denise's own address (her forward is known by the
+ * sender quoted in it). `direct` marks a customer writing from their own address, which is only
+ * known once owner_email is set: until then a plain email could be a note she sent herself. A form
+ * notification has a sender only through a Reply-To that isn't a mailer's.
+ */
+function emailSender(db, ev, ctx) {
+  const ownerEmail = ctx.settings.owner_email;
+  if (!ev.from_email || isRelayAddress(ev.from_email, ownerEmail)) return null;
+  const sender = { email: ev.from_email, name: displayName(ev.from_name) };
+  if (ev.channel === "form") return ev.from_reply_to ? { ...sender, direct: false } : null;
+  if (ev.channel !== "email" || forwardedByOwner(db, ev, ctx)) return null;
+  return { ...sender, direct: normalizeEmail(ownerEmail) != null };
+}
+
+/** Customer identity and fields from a parse; an email's sender (emailSender) supplies the email and a missing name. */
 function customerFieldsFrom(fields, sender, overrides = {}) {
   return {
     contact_name: fields.contact_name ?? (sender && !("contact_name" in overrides) ? sender.name : null),
@@ -184,11 +200,13 @@ function customerFieldsFrom(fields, sender, overrides = {}) {
 }
 
 /**
- * The existing customer a message belongs to, or null for a new one. Denise's own entries never
- * join a customer whose phone contradicts the phone she typed.
+ * The existing customer a message belongs to, or null for a new one. A customer emailing from
+ * their own address (sender.direct) is matched by it even when the text brings a new phone.
+ * Denise's own entries never join a customer whose phone contradicts the phone she typed.
  */
-function matchFor(db, ev, identity, { overrides, body, forwarded }) {
-  const customer = matchCustomer(db, { phone: identity.phone, email: identity.email, text: body, forwarded });
+function matchFor(db, ev, identity, { overrides, body, forwarded, sender }) {
+  const emailIsSender = Boolean(sender?.direct) && identity.email === sender.email;
+  const customer = matchCustomer(db, { phone: identity.phone, email: identity.email, text: body, forwarded, emailIsSender });
   const typed = overrides.phone;
   const contradicts = !blank(typed) && !blank(customer?.phone) && normalizePhone(typed) !== customer.phone;
   return OWN_ENTRY_CHANNELS.includes(ev.channel) && contradicts ? null : customer;
@@ -403,7 +421,7 @@ function processMessage(db, ev, msgId, ctx) {
   const rules = ctx.parse(ev.body, parseOptions(event, ctx));
   const overrides = cleanOverrides(ctx.fields);
   const fields = { ...rules, ...overrides };
-  const reading = { rules, fields, overrides, forwarded, body, sender: emailSender(event, ctx) };
+  const reading = { rules, fields, overrides, forwarded, body, sender: emailSender(db, event, ctx) };
   if (ctx.attachJobId != null) {
     const job = getJobRow(db, ctx.attachJobId);
     return attachToJob(db, event, msgId, job, getCustomer(db, job.customer_id), reading);
@@ -427,7 +445,7 @@ function processMessage(db, ev, msgId, ctx) {
 function fallbackCustomer(db, ev, ctx) {
   try {
     const phone = ev.from_phone && ev.from_phone !== ctx.owner ? ev.from_phone : null;
-    const email = emailSender(ev, ctx)?.email ?? null;
+    const email = emailSender(db, ev, ctx)?.email ?? null;
     return matchCustomer(db, { phone, email }) ?? createCustomer(db, { phone, email }, ev.received_at);
   } catch {
     return createCustomer(db, {}, ev.received_at);
@@ -738,7 +756,7 @@ function applyStart(db, jobId, start, ctx) {
 function ownEntryEvent(channel, text, raw, now) {
   return {
     channel, provider: "app", external_id: null, received_at: now,
-    from_phone: null, from_email: null, from_name: null, subject: null,
+    from_phone: null, from_email: null, from_name: null, from_reply_to: false, subject: null,
     body: text, call_status: null, call_duration_s: null, form_fields: null, raw,
   };
 }
@@ -757,11 +775,23 @@ function openJobToAttach(db, id) {
 }
 
 /**
+ * The paste must be from that job's customer. It is not when the preview that offered the
+ * job showed someone else (expected_customer_id), or the text's phone is not the customer's.
+ */
+function assertSameCustomer(db, job, expectedCustomerId, phone) {
+  const customer = getCustomer(db, job.customer_id);
+  const otherCustomer = !blank(expectedCustomerId) && Number(expectedCustomerId) !== customer.id;
+  const otherPhone = phone != null && !blank(customer.phone) && phone !== customer.phone;
+  if (otherCustomer || otherPhone) throw new IngestError("attach_mismatch", ATTACH_MISMATCH_MESSAGE);
+}
+
+/**
  * Quick Add: POST /api/jobs. Writes a 'manual' message holding the original text. With
  * attach_to_job_id the text is the customer's latest message on that open job (status
  * 'attached', no new job); otherwise it creates the job and applies the starting stage.
  * Imports whose next move is hers are due now.
- * Throws IngestError('validation') when who, phone and problem are all empty, and
+ * Throws IngestError('validation') when who, phone and problem are all empty,
+ * IngestError('attach_mismatch') when the text is not from that job's customer, and
  * OutcomeError('missing_arg') for a scheduled stage without visit_date or a bad snooze_until.
  */
 export function ingestManual(db, input = {}, opts = {}) {
@@ -769,16 +799,17 @@ export function ingestManual(db, input = {}, opts = {}) {
   const { settings, tz } = settingsFor(db, opts);
   const text = input.text == null ? "" : String(input.text);
   const raw = { ...input };
-  const attachTo = openJobToAttach(db, input.attach_to_job_id);
-  if (attachTo) {
-    if (blank(text)) throw new IngestError("validation", PASTE_FIRST_MESSAGE);
-    return ingest(db, ownEntryEvent("manual", text, raw, opts.now), { ...opts, settings, attachJobId: attachTo.id, ai: false });
-  }
-  const overrides = cleanOverrides(input.fields);
   const rules = (opts.parse ?? parseMessage)(text, {
     channel: "manual", owner_phone: settings.owner_phone, owner_email: settings.owner_email, techs: settings.techs,
     now: opts.now, tz,
   });
+  const attachTo = openJobToAttach(db, input.attach_to_job_id);
+  if (attachTo) {
+    if (blank(text)) throw new IngestError("validation", PASTE_FIRST_MESSAGE);
+    assertSameCustomer(db, attachTo, input.expected_customer_id, normalizePhone(rules.phone));
+    return ingest(db, ownEntryEvent("manual", text, raw, opts.now), { ...opts, settings, attachJobId: attachTo.id, ai: false });
+  }
+  const overrides = cleanOverrides(input.fields);
   if (!hasWhoPhoneOrProblem({ ...rules, ...overrides })) throw new IngestError("validation", VALIDATION_MESSAGE);
   const start = startFor(input, OPEN_STAGES, { now: opts.now, tz });
   const aiPreviewed = input.parse_mode === "ai";

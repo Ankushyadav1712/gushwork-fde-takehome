@@ -31,8 +31,10 @@ const APP_HEADERS = {
 };
 
 /**
- * Demo mode (seed, demo clock, simulator, Reset demo): never in production, whatever DEMO says;
- * otherwise on unless DEMO is set to something other than 1/true/on/yes (§13.6).
+ * Demo mode (seed, demo clock, simulator, Reset demo) as the environment asks for it: on unless DEMO
+ * is set to something other than 1/true/on/yes (§13.6), and always off under NODE_ENV=production,
+ * whatever the environment says. No variable can turn a production server into a demo; the Vercel
+ * entry (api/index.js), which can never hold real data, passes demo: true in code instead.
  */
 export function isDemo(env = process.env) {
   if (env.NODE_ENV === "production") return false;
@@ -80,13 +82,13 @@ function spaFallback(req, res, next) {
  * now() returns the ISO time for each request (default: the demo-aware server clock).
  * publicUrl is the address links in texts point at (default: PUBLIC_URL, else localhost:3000).
  * fetch is used for Twilio sends; extract replaces the AI extractor (tests).
+ * demo overrides isDemo(env); only api/index.js passes it (true), because a Vercel instance is a demo by design.
  */
 export function createApp({
   db, now = () => clock.now().toISOString(), env = process.env, publicUrl = resolvePublicUrl(env),
-  fetch, extract, clock: clockApi = clock,
+  fetch, extract, clock: clockApi = clock, demo = isDemo(env),
 } = {}) {
   if (!db) throw new Error("createApp: db is required");
-  const demo = isDemo(env);
   const sendText = (msg) => notify.send(msg, { db, now: now(), env, fetch });
   const deps = {
     db, now, env, publicUrl, demo, fetch, extract, clock: clockApi, send: sendText,

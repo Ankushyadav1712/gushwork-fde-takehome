@@ -3,11 +3,11 @@
 // and serialization live in server/context.js.
 import express from "express";
 import * as repo from "../repo.js";
-import { ingestManual, ingestBulk } from "../ingest.js";
+import { ingestManual, ingestBulk, IngestError } from "../ingest.js";
 import { extractWithAI, AI_MODEL } from "../ai.js";
 import { smsMode } from "../notify.js";
 import {
-  invalid, loadJob, performOutcome, performStage, performUndo, performEdit, logTap, updateSettings, sendDigestNow,
+  ApiError, invalid, loadJob, performOutcome, performStage, performUndo, performEdit, logTap, updateSettings, sendDigestNow,
 } from "../actions.js";
 import {
   contextFor, serializeJob, jobDetail, jobList, todayCount, todayPayload, numbersFor, digestPreview,
@@ -32,6 +32,19 @@ function parseFields(parse) {
   const fields = Object.fromEntries(PARSE_FIELDS.map((key) => [key, parse[key] ?? null]));
   fields.urgent = Boolean(parse.urgent);
   return fields;
+}
+
+/** "Rosa's Taqueria's", "Midway Meats'". */
+const possessive = (name) => (/s$/i.test(name) ? `${name}'` : `${name}'s`);
+
+/** Quick Add; a paste that isn't from the chosen job's customer is a 409 the screen answers with "It's a new job". */
+function quickAdd(db, input, opts) {
+  try {
+    return ingestManual(db, input, opts);
+  } catch (err) {
+    if (err instanceof IngestError && err.code === "attach_mismatch") throw new ApiError(409, err.code, err.message);
+    throw err;
+  }
 }
 
 /**
@@ -128,16 +141,16 @@ export function apiRouter(deps) {
     });
   });
 
-  // The whole body is ingestManual's input, so `attach_to_job_id` reaches it as sent.
+  // The whole body is ingestManual's input, so `attach_to_job_id` and `expected_customer_id` reach it as sent.
   router.post("/jobs", (req, res) => {
     const ctx = ctxNow();
-    const result = ingestManual(db, bodyOf(req), {
+    const result = quickAdd(db, bodyOf(req), {
       now: ctx.now, settings: ctx.settings, ...(deps.extract ? { extract: deps.extract } : {}),
     });
     if (result.status === "attached") {
       const title = titleFor(repo.getJobView(db, result.job_id));
       res.status(201).json({
-        job_id: result.job_id, customer_id: result.customer_id, attached: true, toast: `Added to ${title}'s open job.`,
+        job_id: result.job_id, customer_id: result.customer_id, attached: true, toast: `Added to ${possessive(title)} open job.`,
       });
       return;
     }

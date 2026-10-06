@@ -3,7 +3,7 @@
 // job row before it (prev_json) and the columns it changed, so Undo puts back only those (§5.6)
 // and never a later AI read. Each action takes ctx = contextFor(db, now) from the caller.
 import { randomBytes } from "node:crypto";
-import { tx } from "./db.js";
+import { get, tx } from "./db.js";
 import * as repo from "./repo.js";
 import { send } from "./notify.js";
 import { applyOutcome, moveStage, stageLabel, EQUIPMENT } from "../shared/stages.js";
@@ -95,14 +95,36 @@ export function performOutcome(db, jobId, body, ctx) {
   });
 }
 
-/** Job detail stage picker (§5.7): enterStage through moveStage. Not contact. */
+/**
+ * True when the job is in Lost because its own "Not a job" tap blocked the customer, who is still
+ * blocked: the tap is the latest move into Lost that wasn't undone, and the customer was not
+ * blocked before it.
+ */
+function blockedByThisJob(db, jv) {
+  if (jv.stage !== "lost" || !jv.customer?.blocked) return false;
+  const entry = get(db, `SELECT json_extract(data_json, '$.outcome') AS outcome,
+      json_extract(data_json, '$.customer_prev.blocked') AS was_blocked
+    FROM events WHERE job_id = ? AND undone = 0 AND kind IN ('outcome', 'stage')
+      AND json_extract(data_json, '$.to') = 'lost'
+    ORDER BY id DESC LIMIT 1`, [jv.id]);
+  return entry?.outcome === "not_a_job" && entry.was_blocked === 0;
+}
+
+/**
+ * Job detail stage picker (§5.7): enterStage through moveStage. Not contact. Moving a job out of
+ * Lost unblocks the number its "Not a job" tap blocked, in the same event, so Undo blocks it again.
+ */
 export function performStage(db, jobId, body, ctx) {
   return tx(db, () => {
     const jv = loadJob(db, jobId);
     checkExpectedStage(jv, body.expected_stage);
     const result = moveStage(jv, body.to, actionArgs(body), ctx);
-    const eventId = commitChange(db, jv, result, ctx.now);
-    return { job_id: jv.id, event_id: eventId, toast: result.toast };
+    const unblock = blockedByThisJob(db, jv);
+    const summary = unblock ? `${result.event.summary} - unblocked the number` : result.event.summary;
+    const eventId = commitChange(db, jv, {
+      ...result, event: { ...result.event, summary }, customerPatch: unblock ? { blocked: 0 } : null,
+    }, ctx.now);
+    return { job_id: jv.id, event_id: eventId, toast: unblock ? `${result.toast} Their number is unblocked.` : result.toast };
   });
 }
 

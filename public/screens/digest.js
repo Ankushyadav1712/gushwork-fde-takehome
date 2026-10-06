@@ -15,7 +15,7 @@ const KIND_LABELS = {
   husband_summary: "Numbers",
   manual: "Sent from preview",
 };
-const STATUS_LABELS = { simulated: "Simulated", sent: "Sent", failed: "Failed" };
+const STATUS_LABELS = { simulated: "Simulated", sent: "Sent", sending: "Sending", failed: "Failed" };
 
 /** Toast after Send now, by the outbox row's final status (§11). */
 const SEND_TOASTS = {

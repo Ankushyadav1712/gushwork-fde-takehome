@@ -1,12 +1,14 @@
 // Pickers used inside sheets (§5.4, §4.10). Each one ends in a single onPick/onSave call,
 // so an outcome stays within 3 taps of opening the sheet.
 import { html, useState, useEffect, useRef } from "/vendor/preact-htm.js";
-import { localDate, addDays, nextBusinessDay, weekdayName, shortDateLabel } from "/shared/time.js";
+import { localDate, addDays, daysBetween, nextBusinessDay, weekdayName, shortDateLabel } from "/shared/time.js";
 import { money } from "/shared/format.js";
 import { LOST_REASONS } from "/shared/stages.js";
 import { Icon } from "./icons.js";
 
 const NEXT_WEEKDAYS = 3;
+// A day further out than this is labelled with its date: "Mon Oct 12", not a second "Monday".
+const WEEKDAY_NAME_DAYS = 6;
 
 /**
  * Day chips for "yes" and "scheduled": Today, Tomorrow, then the next 3 weekdays (Mon-Fri)
@@ -35,9 +37,12 @@ function snoozeChoices(nowIso, tz) {
   ];
 }
 
-function ChoiceButton({ label, onClick, accent = false, wide = false, className = "" }) {
-  const cls = `btn choice ${accent ? "btn-primary" : "btn-secondary"} ${wide ? "wide" : ""} ${className}`;
-  return html`<button type="button" class=${cls} onClick=${onClick}>${label}</button>`;
+/** `note` is a small visible tag ("asked"); `ariaLabel` then says what it means in words. */
+function ChoiceButton({ label, onClick, accent = false, wide = false, className = "", note = null, ariaLabel = null }) {
+  const cls = `btn choice ${accent ? "btn-primary" : "btn-secondary"} ${wide ? "wide" : ""} ${note ? "has-note" : ""} ${className}`;
+  return html`<button type="button" class=${cls} aria-label=${ariaLabel} onClick=${onClick}>
+    ${label} ${note && html`<span class="choice-note" aria-hidden="true">${note}</span>`}
+  </button>`;
 }
 
 /** "Pick a day": a native date input plus a confirm button. */
@@ -63,18 +68,23 @@ function PickADay({ min, onPick, tz, wide = true, label = "Pick a day" }) {
 
 /**
  * `highlight` (a YYYY-MM-DD: the day the customer asked for, or a suggested visit date) gets the
- * accent colour, and is added as its own chip when it isn't one of the usual days.
+ * accent colour and an "asked" tag, and is added as its own chip when it isn't one of the usual days.
  */
 export function DayPicker({ now, tz, allowNone = false, highlight = null, onPick }) {
   const today = localDate(now, tz);
   const choices = dayChoices(now, tz);
   if (highlight && highlight >= today && !choices.some((c) => c.value === highlight)) {
-    choices.push({ label: weekdayName(highlight, { long: true }), value: highlight });
+    const label = daysBetween(today, highlight) > WEEKDAY_NAME_DAYS
+      ? shortDateLabel(highlight, tz) : weekdayName(highlight, { long: true });
+    choices.push({ label, value: highlight });
   }
   const chipCount = choices.length + (allowNone ? 1 : 0);
   return html`<div class="choice-grid">
-    ${choices.map((c) => html`<${ChoiceButton} key=${c.value} label=${c.label} accent=${c.value === highlight}
-      onClick=${() => onPick(c.value)} />`)}
+    ${choices.map((c) => {
+      const asked = c.value === highlight;
+      return html`<${ChoiceButton} key=${c.value} label=${c.label} accent=${asked} note=${asked ? "asked" : null}
+        ariaLabel=${asked ? `${c.label}, the day they asked for` : null} onClick=${() => onPick(c.value)} />`;
+    })}
     ${allowNone && html`<${ChoiceButton} label="No date yet" onClick=${() => onPick(null)} />`}
     <${PickADay} min=${today} tz=${tz} wide=${chipCount % 2 === 0} onPick=${onPick} />
   </div>`;

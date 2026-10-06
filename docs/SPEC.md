@@ -9,16 +9,14 @@ The spec is exact on purpose. Many strings and expected outputs here, like the M
 
 ## R. Revisions after the review
 
-An independent review of the working build tested intake integrity, security, the rules, the UX and the code. Each finding it confirmed is fixed with a regression test, and the review produced these rule changes:
+An independent review of the working build tested intake integrity, security, the rules, the UX and the code. A second round then re-checked the fixes. Each confirmed finding is fixed with a regression test, and the two rounds produced these rule changes:
 
-1. **Customer identity (§7.3).** A sender address is never treated as a customer's identity when any of these is true:
-   - it is a relay or system address (no-reply, form services, wordpress@…);
-   - it is Denise's own address (setting `owner_email`);
-   - the message is a form notification or a forwarded email.
-
-   Other identity rules:
+1. **Customer identity (§7.3).**
+   - **Never an identity:** relay and system senders (no-reply, form-service domains, wordpress@…) and Denise's own address (setting `owner_email`).
+   - **Form notifications:** the customer comes from the form. A non-relay Reply-To also counts.
+   - **Denise's own forwards:** known by the customer quoted inside, from the first `From:` line after the forward marker. A forward from anyone else keeps its sender as the customer. Until `owner_email` is set, a forward from an address no customer has is taken as hers.
    - Reply-To beats From.
-   - When a message carries a phone number that matches no one, it is never matched by email instead.
+   - When a message carries a phone number that matches no one, it isn't matched by email instead. The exception: a customer writing from their own address, once `owner_email` is set; the new phone then only fills a blank.
    - Quick Add and Brain dump link to an existing customer only on a phone match, or an email match when no phone was typed.
 
    *Why:* website-form notifications all come from one `no-reply@` address, so different customers' leads were being merged into one job.
@@ -52,6 +50,22 @@ An independent review of the working build tested intake integrity, security, th
    - Links in texts use the real port when `PUBLIC_URL` is unset.
    - `.env` is read without Node's warning.
    - AI parsing uses **Claude Sonnet** (`claude-sonnet-5-5`); `ANTHROPIC_MODEL` overrides it.
+
+11. **Attachments.** `/api/inbound/email` accepts up to 25 MB, including `multipart/form-data` (Mailgun) and Postmark JSON with photos. Attachment contents are never stored; their name, type and size are. The message notes "[N attachment(s)]". `INBOUND_TOKEN` is checked before the body is read.
+12. **Quick Add attach guard.** "Add this to that job" sends `expected_customer_id`. The server answers 409 `attach_mismatch` ("That text looks like it's from someone else. Add it as a new job instead.") when either is true:
+    - the job belongs to someone else;
+    - the pasted text's phone differs from that customer's.
+13. **Unblocking.** Bringing back a job that "Not a job" had blocked also unblocks the number ("Brought back - unblocked the number").
+14. **Text retries.** A failed text is retried 15 minutes after the first try and 45 minutes after the second, at most 3 tries, inside its window. A text stuck "sending" for 5 minutes counts as failed.
+15. **Day picker and links.**
+    - The day the customer asked for carries an "asked" tag.
+    - A day more than 6 days out is labelled by its date ("Mon Oct 12").
+    - "Scheduled today" opens Jobs filtered to today's visits.
+16. **Vercel demo entry.** `api/index.js` runs the app as one Vercel function:
+    - It is always a demo. That is decided in code; no environment variable can make `server/index.js` a demo in production.
+    - SQLite lives in `/tmp`, one copy per instance.
+    - The scheduler is checked on requests, at most once a minute.
+    - The page and the `shared/` modules come from the CDN.
 
 ## 0. Engineering conventions
 
@@ -1361,6 +1375,7 @@ shared/     pure ES modules, used by both server and browser (served at /shared/
   templates.js    pre-written texts to customers and techs
 server/
   index.js        boot: env, database, demo clock, seed, scheduler, startup line
+  runtime.js      the boot steps index.js and the Vercel entry share (production rules, DB, seed)
   env.js          reads .env when it exists
   app.js          the Express app: webhooks, static files, passcode guard, API, demo routes
   auth.js         passcode login and the session cookie
@@ -1379,6 +1394,7 @@ server/
   routes/         api.js (JSON API), inbound.js (webhooks), sim.js (demo only)
 public/      Preact + htm, no build step: app.js, api.js, screens/, ui/, styles.css
 test/        node:test: unit + integration (in-memory SQLite, real HTTP)
+api/         index.js: the Vercel demo function (always a demo; SQLite in /tmp)
 scripts/     e2e.mjs: walks docs/DEMO.md in headless Chrome
 ```
 

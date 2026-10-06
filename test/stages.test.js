@@ -6,6 +6,12 @@ import {
   stageLabel, equipmentLabel,
 } from "../shared/stages.js";
 import { SEED_ANCHOR as A, at, ctxAt, makeJobView } from "./fixtures/seed-state.js";
+import { openDb } from "../server/db.js";
+import * as repo from "../server/repo.js";
+import { contextFor } from "../server/context.js";
+import { ingest, ingestManual } from "../server/ingest.js";
+import { performOutcome, performStage, performUndo } from "../server/actions.js";
+import { addMinutes } from "../shared/time.js";
 
 const ctx = ctxAt(A); // Mon Oct 5 2026 07:00 America/Chicago
 const MON_0000 = "2026-10-05T05:00:00.000Z";
@@ -481,6 +487,37 @@ test("moveStage: the Job detail stage picker (§5.7)", () => {
   assert.throws(() => moveStage(jobIn("quote"), "quote", {}, ctx), outcomeError("invalid_outcome"));
   assert.throws(() => moveStage(jobIn("quote"), "scheduled", {}, ctx), outcomeError("missing_arg"));
   assert.equal(moveStage(jobIn("quote"), "waiting_yes", { amount: "900" }, ctx).patch.quote_amount, 900);
+});
+
+test("regression N1: leaving Lost unblocks the number this job's 'Not a job' tap blocked; Undo blocks it again", () => {
+  const db = openDb(":memory:");
+  repo.ensureSettings(db);
+  const ctxIn = (minutes) => contextFor(db, addMinutes(A, minutes));
+  const textIn = (body, minutes) => ingest(db, {
+    channel: "sms", provider: "twilio", external_id: `SM-${minutes}`, received_at: addMinutes(A, minutes),
+    from_phone: "+13125550888", body,
+  }, { now: addMinutes(A, minutes), ai: false });
+  const lou = textIn("Hi its Lou at Lous Pizza, walk-in cooler is warm", 0).job_id;
+  const again = ingestManual(db, { text: "Lou 312-555-0888 ice machine leaking too" }, { now: A, ai: false }).job_id;
+  const blocked = () => repo.getCustomer(db, repo.getJobRow(db, lou).customer_id).blocked;
+
+  performOutcome(db, lou, { outcome: "not_a_job", block: true }, ctxIn(1));
+  performOutcome(db, again, { outcome: "not_a_job", block: true }, ctxIn(1));
+  assert.equal(textIn("Hello?", 2).status, "blocked");
+  const other = performStage(db, again, { to: "new" }, ctxIn(3));
+  assert.equal(blocked(), 1, "the other job's tap didn't block them, so it doesn't unblock them");
+  assert.equal(repo.getEvent(db, other.event_id).summary, "Brought back");
+
+  const back = performStage(db, lou, { to: "new" }, ctxIn(4));
+  assert.equal(blocked(), 0);
+  assert.equal(back.toast, "Moved to New - call them back. Their number is unblocked.");
+  assert.equal(repo.getEvent(db, back.event_id).summary, "Brought back - unblocked the number");
+  performUndo(db, lou, back.event_id, ctxIn(5));
+  assert.equal(blocked(), 1, "Undo puts the block back");
+
+  performStage(db, lou, { to: "done" }, ctxIn(6));
+  assert.equal(blocked(), 0, "Done from Lost unblocks too");
+  assert.notEqual(textIn("Hello? still need someone for the walk-in", 7).job_id, null);
 });
 
 function pick(obj, keys) {

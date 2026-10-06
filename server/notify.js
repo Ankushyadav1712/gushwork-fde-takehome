@@ -7,10 +7,21 @@ const TWILIO_API = "https://api.twilio.com/2010-04-01/Accounts";
 const SEND_TIMEOUT_MS = 15_000;
 /** Set while a Twilio send is in flight; the outbox status column only allows simulated/sent/failed. */
 export const SENDING_NOTE = "sending";
+/** A send still in flight after this long never finished (the server stopped mid-send). */
+export const STUCK_SENDING_MS = 5 * 60_000;
 
 /** 'twilio' when TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN and TWILIO_FROM are all set, else 'simulated'. */
 export function smsMode(env = process.env) {
   return env.TWILIO_ACCOUNT_SID && env.TWILIO_AUTH_TOKEN && env.TWILIO_FROM ? "twilio" : "simulated";
+}
+
+/**
+ * Where an outbox row stands at `now`: 'simulated', 'sent', 'sending' or 'failed'. A row left
+ * sending for over STUCK_SENDING_MS counts as failed, so it can be tried again.
+ */
+export function deliveryStatus(row, now) {
+  if (row.status !== "failed" || row.error !== SENDING_NOTE) return row.status;
+  return Date.parse(now) - Date.parse(row.created_at) > STUCK_SENDING_MS ? "failed" : "sending";
 }
 
 const nowIsoOf = (now) => (typeof now === "function" ? now() : now) ?? new Date().toISOString();

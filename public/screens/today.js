@@ -103,12 +103,12 @@ function Section({ section, leavingId, onOpen, onTap }) {
   </section>`;
 }
 
-/** "Scheduled today: {k} · Put off till later: {s}" (§4.8), each half a link to those jobs. */
+/** "Scheduled today: {k} · Put off till later: {s}" (§4.8), each half a link to just those jobs. */
 function TodayFooter({ footer }) {
   if (!footer) return null;
   return html`<footer class="today-footer">
     <p class="footer-links num">
-      <a class="footer-link" href="#/jobs?stage=scheduled">${`Scheduled today: ${footer.scheduled_today}`}</a>
+      <a class="footer-link" href="#/jobs?stage=scheduled&day=today">${`Scheduled today: ${footer.scheduled_today}`}</a>
       <span aria-hidden="true">·</span>
       <a class="footer-link" href="#/jobs?stage=later">${`Put off till later: ${footer.snoozed}`}</a>
     </p>

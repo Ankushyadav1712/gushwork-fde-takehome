@@ -1,0 +1,10 @@
+# Never upload these to Vercel: local secrets and data, and files the demo function doesn't need.
+.env
+.env.*
+data/
+docs/
+test/
+scripts/
+Dockerfile
+.dockerignore
+render.yaml

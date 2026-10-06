@@ -1,6 +1,6 @@
 // Browser test of the 3-minute demo (docs/DEMO.md) in headless Chrome at phone size (390x844).
-// It boots its own server (DEMO=1, a temporary database, a free port, AI off), walks the script
-// step by step and prints what passed. Any failed step, page error or failed request exits 1.
+// It boots its own server (DEMO=1, a temporary database, a free port or E2E_PORT, AI off), walks the
+// script step by step and prints what passed. Any failed step, page error or failed request exits 1.
 // Not part of `npm test`; run `npm run e2e`. CHROME_PATH overrides the Chrome binary.
 import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -28,11 +28,11 @@ const BELLA_HISTORY = [
 // ---------------------------------------------------------------------------
 // Server and browser
 
-/** Starts the app on a free port from an empty folder (so no .env is read). Resolves {url, log, stop}. */
+/** Starts the app on E2E_PORT or a free port, from an empty folder (so no .env is read). Resolves {url, log, stop}. */
 function startServer(dir) {
   const child = spawn(process.execPath, [SERVER_ENTRY], {
     cwd: dir,
-    env: { PATH: process.env.PATH, DEMO: "1", PORT: "0", DB_PATH: join(dir, "callback.db"), AI_PARSING: "off" },
+    env: { PATH: process.env.PATH, DEMO: "1", PORT: process.env.E2E_PORT || "0", DB_PATH: join(dir, "callback.db"), AI_PARSING: "off" },
     stdio: ["ignore", "pipe", "pipe"],
   });
   let log = "";
@@ -209,8 +209,8 @@ function demoSteps(page, server) {
       await openCard("Rosa's Taqueria");
       assert.equal((await textsOf(".sheet .stack .btn"))[0], "Mark as yes?");
       await tap(".sheet button", "Mark as yes?");
-      assert.deepEqual(await textsOf(".sheet .choice.btn-primary"), ["Thursday"], "the day Rosa named is highlighted");
-      await tap(".sheet button", "Thursday");
+      assert.deepEqual(await textsOf(".sheet .choice.btn-primary"), ["Thursday asked"], "the day Rosa named is highlighted and tagged");
+      await tap(".sheet button", "Thursday asked");
       await tap(".sheet button", "Mike");
       await toast("Booked for Thu with Mike. I'll ask if it got done Fri.");
     }],

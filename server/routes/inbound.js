@@ -3,7 +3,7 @@
 import express from "express";
 import { ingest } from "../ingest.js";
 import {
-  fromTwilioSms, fromTwilioVoice, fromPostmark, fromMailgun, fromRawEmail, fromForm, fromGeneric,
+  fromTwilioSms, fromTwilioVoice, fromPostmark, fromMailgun, fromRawEmail, fromForm, fromGeneric, decodeFormData,
   verifyTwilioSignature, verifyMailgunSignature, mailgunSignatureFields, safeEqual,
 } from "../adapters.js";
 import { getSettings } from "../repo.js";
@@ -14,17 +14,30 @@ export const INBOUND_PATHS = Object.freeze({
   email: "/api/inbound/email",
   form: "/api/inbound/form",
 });
-const ALL_PATHS = new Set(Object.values(INBOUND_PATHS));
+const ROUTE_OF_PATH = new Map(Object.entries(INBOUND_PATHS).map(([route, path]) => [path, route]));
 const TWILIO_ROUTES = new Set(["sms", "call"]);
-const LIMIT = "1mb";
+// Email can carry attachments (a photo of the broken unit), so it takes up to 25 MB; the rest 1 MB.
+const LIMIT_MB = { email: 25 };
+const limitMb = (route) => LIMIT_MB[route] ?? 1;
 const TWIML_EMPTY = "<Response/>";
 const MAILGUN_TOKEN_TTL_MS = 10 * 60_000;
 
-const parsers = [
-  express.json({ limit: LIMIT }),
-  express.urlencoded({ extended: false, limit: LIMIT }),
-  express.text({ type: ["text/plain", "message/rfc822"], limit: LIMIT }),
-];
+/** multipart/form-data arrives as a Buffer: its text fields become the payload, file parts only their name, type and size. */
+function formData(req, res, next) {
+  if (Buffer.isBuffer(req.body)) req.body = decodeFormData(req.body, req.get("content-type"));
+  next();
+}
+
+function parsersFor(route) {
+  const limit = `${limitMb(route)}mb`;
+  return [
+    express.json({ limit }),
+    express.urlencoded({ extended: false, limit }),
+    express.text({ type: ["text/plain", "message/rfc822"], limit }),
+    express.raw({ type: "multipart/form-data", limit }),
+    formData,
+  ];
+}
 
 const isObject = (v) => v != null && typeof v === "object" && !Array.isArray(v);
 const has = (p, ...keys) => isObject(p) && keys.some((k) => p[k] !== undefined);
@@ -104,14 +117,25 @@ function mailgunTokenLog() {
   };
 }
 
+/** A refused request, logged (path and reason only) so a wrong PUBLIC_URL or token shows up in the server log. */
+function refuse(req, res, failure) {
+  console.warn(`[inbound] ${req.method} ${req.path} refused with ${failure[0]}: ${failure[2]}`);
+  sendError(res, ...failure);
+}
+
+/** C2: the token on every route, checked before the body is read (an email may be 25 MB). */
+function tokenGuard(env) {
+  return (req, res, next) => {
+    if (!env.INBOUND_TOKEN || safeEqual(req.query?.token, env.INBOUND_TOKEN)) next();
+    else refuse(req, res, [401, "unauthorized", "Missing or wrong token."]);
+  };
+}
+
 /**
- * C2: the token on every route; Twilio signatures on sms/call and Mailgun's on email whenever
- * their keys are set. Twilio signs the public address it posts to, so that is what is checked.
+ * C2: Twilio signatures on sms/call and Mailgun's on email whenever their keys are set. Twilio
+ * signs the public address it posts to, so that is what is checked.
  */
-function guardFailure(route, req, { env, publicUrl }, tokens) {
-  if (env.INBOUND_TOKEN && !safeEqual(req.query?.token, env.INBOUND_TOKEN)) {
-    return [401, "unauthorized", "Missing or wrong token."];
-  }
+function signatureFailure(route, req, { env, publicUrl }, tokens) {
   if (env.TWILIO_AUTH_TOKEN && TWILIO_ROUTES.has(route)) {
     const params = isObject(req.body) ? req.body : {};
     const url = publicUrl + req.originalUrl;
@@ -143,13 +167,6 @@ function unreadableTextOrCall(route, payload) {
   return null;
 }
 
-/** guardFailure, logged (path and reason only) so a wrong PUBLIC_URL or token shows up in the server log. */
-function refusal(route, req, guards, tokens) {
-  const failure = guardFailure(route, req, guards, tokens);
-  if (failure) console.warn(`[inbound] ${req.method} ${req.path} refused with ${failure[0]}: ${failure[2]}`);
-  return failure;
-}
-
 function handlerFor(route, deps, tokens) {
   const guards = { env: deps.env ?? process.env, publicUrl: deps.publicUrl };
   return (req, res) => {
@@ -158,9 +175,14 @@ function handlerFor(route, deps, tokens) {
       sendError(res, 400, "validation", "Empty or unreadable body.");
       return;
     }
-    const failure = refusal(route, req, guards, tokens) ?? unreadableTextOrCall(route, payload);
-    if (failure) {
-      sendError(res, ...failure);
+    const refused = signatureFailure(route, req, guards, tokens);
+    if (refused) {
+      refuse(req, res, refused);
+      return;
+    }
+    const unreadable = unreadableTextOrCall(route, payload);
+    if (unreadable) {
+      sendError(res, ...unreadable);
       return;
     }
     const { format, result } = ingestPayload(route, payload, deps);
@@ -173,13 +195,14 @@ function handlerFor(route, deps, tokens) {
   };
 }
 
-/** Body-parser failures on the inbound routes become JSON errors (413 for bodies over 1 MB). */
+/** Body-parser failures on the inbound routes become JSON errors (413 for bodies over the route's limit). */
 function inboundErrors(err, req, res, next) {
-  if (!ALL_PATHS.has(req.path) || res.headersSent) {
+  const route = ROUTE_OF_PATH.get(req.path);
+  if (!route || res.headersSent) {
     next(err);
     return;
   }
-  if (err?.type === "entity.too.large") sendError(res, 413, "validation", "Body is over 1 MB.");
+  if (err?.type === "entity.too.large") sendError(res, 413, "validation", `Body is over ${limitMb(route)} MB.`);
   else if (err?.status >= 400 && err.status < 500) sendError(res, err.status, "validation", "Unreadable body.");
   else next(err);
 }
@@ -191,8 +214,9 @@ function inboundErrors(err, req, res, next) {
 export function inboundRouter(deps) {
   const router = express.Router();
   const mailgunTokens = mailgunTokenLog();
+  const checkToken = tokenGuard(deps.env ?? process.env);
   for (const [route, path] of Object.entries(INBOUND_PATHS)) {
-    router.post(path, ...parsers, handlerFor(route, deps, mailgunTokens));
+    router.post(path, checkToken, ...parsersFor(route), handlerFor(route, deps, mailgunTokens));
   }
   router.use(inboundErrors);
   return router;

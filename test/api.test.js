@@ -527,6 +527,19 @@ test("C5 Quick Add onto her open job: the text becomes the customer's message on
   assert.equal(junk.json.error.message, "Add a name, a phone number, or what's wrong.");
 });
 
+test("Quick Add onto an open job: a paste from someone else is 409 attach_mismatch; the toast says Midway Meats' (ux-N1)", async () => {
+  const api = await start();
+  const midway = repo.getJobRow(api.db, 11).customer_id;
+  const attach = (text, expected) => api.post("/api/jobs", { text, attach_to_job_id: 11, expected_customer_id: expected });
+  const wrong = await attach("Rosa 312-555-0118: the walk-in is warm again", midway);
+  assert.deepEqual([wrong.status, wrong.json.error], [409, {
+    code: "attach_mismatch", message: "That text looks like it's from someone else. Add it as a new job instead.",
+  }]);
+  assert.equal((await attach("Gus here, any update?", midway + 1)).status, 409, "the preview showed another customer");
+  const right = await attach("Gus (312) 555-0174: any update on that quote?", midway);
+  assert.deepEqual([right.status, right.json.toast], [201, "Added to Midway Meats' open job."]);
+});
+
 test("regression RT-4 (C6): a Brain dump backlog is not this week's new, won or done work", async () => {
   const api = await start();
   const before = (await api.get("/api/numbers")).json;
@@ -640,7 +653,7 @@ test("settings: GET shape, PUT validation and normalisation, link regeneration",
     { techs: [{ name: "", phone: "3125550121" }] }, { company_name: "" }]) {
     assert.deepEqual(errorOf(await api.put("/api/settings", bad)), [400, "validation"], JSON.stringify(bad));
   }
-  assert.equal(s.owner_email, null);
+  assert.equal(s.owner_email, "denise@frostline.example", "the demo knows Denise's address");
   assert.equal((await api.put("/api/settings", { owner_email: " Denise@Frostline.Example " })).json.owner_email, "denise@frostline.example");
   assert.deepEqual(errorOf(await api.put("/api/settings", { owner_email: "denise at frostline" })), [400, "validation"]);
   assert.equal((await api.put("/api/settings", { owner_email: "" })).json.owner_email, null);

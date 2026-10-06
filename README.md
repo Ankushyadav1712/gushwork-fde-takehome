@@ -59,6 +59,8 @@ server/      Node + Express 5 + built-in SQLite
   ai.js          optional Claude extraction with structured outputs; never blocks or loses a lead
   db.js, repo.js schema and queries
   seed.js        demo seed: replays the Friday-to-Monday weekend through the real code paths
+  runtime.js     boot steps shared by index.js and the Vercel entry
+api/         index.js: the Vercel demo function (always a demo; SQLite in /tmp)
 public/      Preact + htm, no build step; phone-first, light/dark
 test/        node:test, unit + integration (in-memory SQLite, real HTTP)
 scripts/     e2e.mjs: the demo script, walked in headless Chrome
@@ -99,7 +101,7 @@ SQLite lives at `DB_PATH`. Back it up nightly. One small VM with HTTPS in front 
 
 ## Deploy a demo
 
-The app is one long-running Node process with a SQLite file, so it needs a host that runs a container or a server. Serverless hosts like Vercel don't fit: they have no lasting disk for the database and no always-on process for the 7am text and reminders.
+The app is one long-running Node process with a SQLite file. Render or any Docker host runs it as it is. Vercel can run the demo, but only the demo: it has no lasting disk for the database and no always-on process for the 7am text and reminders.
 
 **Render (free, uses [`render.yaml`](render.yaml))**
 1. In Render, choose **New → Blueprint** and pick this repo. It builds the [`Dockerfile`](Dockerfile) with `DEMO=1`.
@@ -107,6 +109,22 @@ The app is one long-running Node process with a SQLite file, so it needs a host 
 3. Leave `ANTHROPIC_API_KEY` unset on a public demo, or anyone with the link can spend your credits.
 
 The free plan sleeps after 15 idle minutes, so the first visit takes up to a minute. Its disk is temporary, so every restart re-seeds the demo week.
+
+**Vercel (demo only, uses [`vercel.json`](vercel.json))**
+1. In Vercel, choose **Add New → Project**, import this repo and click **Deploy**. It needs no settings. `vercel.json` serves the page and its modules from Vercel's CDN and sends `/api` and `/n` to one function, [`api/index.js`](api/index.js).
+2. Recommended: in **Settings → Environment Variables**, add `NODEJS_HELPERS=0`. That is Vercel's documented switch for handing raw requests to the app; the function already avoids the helpers, and this makes it certain.
+3. Optional passcode: set `APP_PASSCODE` **and** `SESSION_SECRET` (any long random string). Without `SESSION_SECRET`, each instance signs logins with its own secret, so visitors get asked again.
+4. Leave `ANTHROPIC_API_KEY` unset, or anyone with the link can spend your credits.
+
+Share the production address (`<project>.vercel.app`). By default Vercel puts preview and per-deployment addresses behind a Vercel login.
+
+What to expect:
+- **It is always the demo.** The function turns on demo mode in code and keeps SQLite in `/tmp`, so it can't hold real data. No environment variable can do the same to a regular server: under `NODE_ENV=production`, `server/index.js` is never a demo.
+- **The data doesn't last.** Each function instance keeps its own demo data in `/tmp`. A cold start or a second instance shows a freshly seeded Monday 7:00am week, so changes don't last.
+- **Scheduled texts wait for a visit.** There is no always-on process, so the 7am text, the Friday sweep and the reminders are checked when someone uses the app (at most once a minute). **Demo controls** move the clock as usual.
+- **Smaller inbound emails.** Vercel caps a request at 4.5 MB, so an inbound email with large photos is refused there. Docker and Render accept up to 25 MB.
+
+For anything real, use Docker or Render with a persistent disk.
 
 **Any Docker host**
 

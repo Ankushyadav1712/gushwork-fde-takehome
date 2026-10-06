@@ -330,28 +330,28 @@ test("replyIntent: yes, no, both and neither", () => {
 
 test("unwrapForward: Fwd: prefix with inline From line", () => {
   assert.deepEqual(unwrapForward("Fwd: From Gus (312) 555-0174: hey denise any update?", OWNER), {
-    body: "hey denise any update?", phone: "+13125550174", name: "Gus", forwarded: true,
+    body: "hey denise any update?", phone: "+13125550174", name: "Gus", email: null, forwarded: true,
   });
 });
 
 test("unwrapForward: Begin forwarded message block", () => {
   const r = unwrapForward("Begin forwarded message:\n\nFrom: Gus (312) 555-0174:\nfreezer door still sticking", OWNER);
-  assert.deepEqual(r, { body: "freezer door still sticking", phone: "+13125550174", name: "Gus", forwarded: true });
+  assert.deepEqual(r, { body: "freezer door still sticking", phone: "+13125550174", name: "Gus", email: null, forwarded: true });
 });
 
 test("unwrapForward: From: NAME PHONE, FW: and email-style markers", () => {
   const r = unwrapForward("FW: ---------- Forwarded message ---------\nFrom: Rosa Diaz 312-555-0118\nprep table is warm", OWNER);
-  assert.deepEqual(r, { body: "prep table is warm", phone: "+13125550118", name: "Rosa Diaz", forwarded: true });
+  assert.deepEqual(r, { body: "prep table is warm", phone: "+13125550118", name: "Rosa Diaz", email: null, forwarded: true });
   const r2 = unwrapForward("-----Original Message-----\nwalk-in is down", OWNER);
-  assert.deepEqual(r2, { body: "walk-in is down", phone: null, name: null, forwarded: true });
+  assert.deepEqual(r2, { body: "walk-in is down", phone: null, name: null, email: null, forwarded: true });
 });
 
 test("unwrapForward: the owner's own number is never the customer's", () => {
-  assert.deepEqual(unwrapForward("From: (312) 555-0100: test", OWNER), { body: "test", phone: null, name: null, forwarded: true });
+  assert.deepEqual(unwrapForward("From: (312) 555-0100: test", OWNER), { body: "test", phone: null, name: null, email: null, forwarded: true });
 });
 
 test("unwrapForward: plain text passes through", () => {
-  assert.deepEqual(unwrapForward("walk-in down at Joe's", OWNER), { body: "walk-in down at Joe's", phone: null, name: null, forwarded: false });
+  assert.deepEqual(unwrapForward("walk-in down at Joe's", OWNER), { body: "walk-in down at Joe's", phone: null, name: null, email: null, forwarded: false });
 });
 
 // ---------------------------------------------------------------------------
@@ -687,4 +687,48 @@ test("the guard: a parser error is logged by name only and the caller gets the e
     console.warn = warn;
   }
   assert.deepEqual(logged, ["[parse] mergeParse failed (Error)"]);
+});
+
+// ---------------------------------------------------------------------------
+// Re-verification fixes (intake-N2, N6, N7, N10)
+
+test("a leading ask about the visit gives way to the sentence that names the equipment (intake-N7)", () => {
+  assert.equal(parse("Could you send someone out today? Our ice machine stopped making ice", "sms", "+13125557811").problem,
+    "Ice machine stopped making ice");
+  assert.equal(parse("Will you be able to come today? walk-in cooler 48F", "sms", "+13125557812").problem, "Walk-in cooler 48F");
+  // An ask that names the equipment, or has nothing better after it, stays the problem.
+  assert.equal(parse("Can you come look at our ice machine tomorrow? It's leaking.", "sms", "+13125557813").problem,
+    "Come look at our ice machine tomorrow");
+  assert.equal(parse("Can you call me about the noise? It started yesterday.", "sms", "+13125557814").problem, "Call me about the noise");
+});
+
+test("an apostrophe in an address is part of it; a quote mark around one is not (intake-N6)", () => {
+  assert.equal(normalizeEmail("Sean.O'Brien@obriens-pub.example"), "sean.o'brien@obriens-pub.example");
+  assert.equal(parse("Keg cooler warm, email sean.o'brien@obriens-pub.example", "email").email, "sean.o'brien@obriens-pub.example");
+  assert.equal(parse("Keg cooler warm, write to 'kim@pub.example' please", "email").email, "kim@pub.example");
+});
+
+test("form-service domains match exactly or as a subdomain, never a business that starts the same (intake-N10)", () => {
+  for (const email of ["x@wix.com", "no@crm.wix.com", "x@mail.typeform.com", "x@notifications.hubspot.com"]) {
+    assert.equal(isRelayAddress(email), true, email);
+  }
+  for (const email of ["manager@wixomgrill.example", "chef@typeformal.example", "ops@hubspotted-deli.example", "x@wix.com.example"]) {
+    assert.equal(isRelayAddress(email), false, email);
+  }
+});
+
+test("a forwarded email's From line is the customer's address, unless it is a mailer's or the owner's (intake-N2)", () => {
+  const forward = (from, body) => `---------- Forwarded message ---------\nFrom: ${from}\nDate: Mon, Oct 5, 2026\n`
+    + `Subject: walk-in\nTo: Denise <denise@frostline.example>\n\n${body}`;
+  assertFields(parse(forward("Ann Chef <ann@bistro.example>", "Hi Denise, our walk-in cooler is warm. Please email me back."), "email"), {
+    contact_name: "Ann Chef", email: "ann@bistro.example", phone: null, problem: "Walk-in cooler is warm",
+  });
+  assert.deepEqual(unwrapForward(forward("ann@bistro.example", "warm"), OWNER).email, "ann@bistro.example");
+  // A mailer's From gives way to the form's Email field; the owner's own address is never the customer's.
+  assert.equal(parse(forward("Frostline Website <forms@frostline.example>", "Name: Doyle\nEmail: d@doyle.example\nMessage: warm"), "email").email,
+    "d@doyle.example");
+  assert.equal(parse(forward("Denise <denise@frostline.example>", "walk-in warm"), "email", null, { owner_email: "denise@frostline.example" }).email,
+    null);
+  // Header lines with no forward marker still never give an address (C4).
+  assert.equal(parse("From: Ann Chef <ann@bistro.example>\nTo: denise@frostline.example\n\nwalk-in warm", "email").email, null);
 });

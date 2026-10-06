@@ -252,6 +252,10 @@ test("matchCustomer: phone, then email, then business name for forwarded texts o
   // No phone: email matches. A phone that matches nobody is a different person: no email fallback (C4).
   assert.equal(matchCustomer(db, { email: "Priya.Shah@FreshMart.example" }).id, fresh.id);
   assert.equal(matchCustomer(db, { phone: "+13125550999", email: "Priya.Shah@FreshMart.example" }), null);
+  // Unless the email is the sender's own address: a customer writing with a new number (intake-N1).
+  assert.equal(matchCustomer(db, { phone: "+13125550999", email: "priya.shah@freshmart.example", emailIsSender: true }).id, fresh.id);
+  assert.equal(matchCustomer(db, { phone: "+13125550151", email: "priya.shah@freshmart.example", emailIsSender: true }).id, other.id,
+    "a phone that matches still wins");
   assert.equal(matchCustomer(db, { phone: "555-0199", email: "priya.shah@freshmart.example" }).id, fresh.id,
     "a phone that doesn't normalize counts as no phone");
 

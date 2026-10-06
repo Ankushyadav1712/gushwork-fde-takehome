@@ -2,7 +2,7 @@
 // with (§13.4). Nothing here writes to the database; the actions that do live in server/actions.js.
 import { all, get } from "./db.js";
 import * as repo from "./repo.js";
-import { smsMode, SENDING_NOTE } from "./notify.js";
+import { smsMode, deliveryStatus } from "./notify.js";
 import { AI_MODEL } from "./ai.js";
 import { INBOUND_PATHS } from "./routes/inbound.js";
 import {
@@ -152,17 +152,17 @@ export function jobList(db, filter, q, ctx) {
 // Today, Numbers, outbox and messages
 
 /** True when the latest text to her own phone didn't go out (a text still sending doesn't count). */
-function textsFailing(db, ownerPhone) {
+function textsFailing(db, ownerPhone, now) {
   if (!ownerPhone) return false;
-  const latest = get(db, "SELECT status, error FROM outbox WHERE to_phone = ? ORDER BY created_at DESC, id DESC LIMIT 1", [ownerPhone]);
-  return latest?.status === "failed" && latest.error !== SENDING_NOTE;
+  const latest = get(db, "SELECT status, error, created_at FROM outbox WHERE to_phone = ? ORDER BY created_at DESC, id DESC LIMIT 1", [ownerPhone]);
+  return Boolean(latest) && deliveryStatus(latest, now) === "failed";
 }
 
 /** GET /api/today: buildToday plus the demo-clock pill and whether texts are reaching her. */
 export function todayPayload(db, ctx, { shifted }) {
   const today = buildToday(repo.getJobViews(db, { scope: "all" }), ctx);
   const label = shifted ? `Demo time: ${shortDateLabel(ctx.now, ctx.tz)}, ${timeLabel(ctx.now, ctx.tz)}` : null;
-  return { ...today, demo: { shifted, label }, texts_failing: textsFailing(db, ctx.settings.owner_phone) };
+  return { ...today, demo: { shifted, label }, texts_failing: textsFailing(db, ctx.settings.owner_phone, ctx.now) };
 }
 
 /** The §10 numbers plus their plain-text summary (Numbers screen and the husband's page). */
@@ -180,7 +180,7 @@ export function digestPreview(db, ctx) {
 export function serializeOutbox(rows, ctx) {
   return rows.map((row) => ({
     id: row.id, created_at: row.created_at, at_label: stampLabel(row.created_at, ctx), kind: row.kind,
-    to_phone: row.to_phone, to_name: row.to_name, body: row.body, status: row.status, job_id: row.job_id,
+    to_phone: row.to_phone, to_name: row.to_name, body: row.body, status: deliveryStatus(row, ctx.now), job_id: row.job_id,
   }));
 }
 

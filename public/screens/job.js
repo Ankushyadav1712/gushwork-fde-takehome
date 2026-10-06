@@ -21,6 +21,15 @@ function latestInbound(timeline = []) {
   return timeline.filter((t) => t.actor === "customer" && t.body).sort(newestFirst)[0] || null;
 }
 
+/**
+ * True when the reason line quotes their newest message (it is unread). The ReplyQuote under it
+ * shows that message in full, so the reason is left out rather than said twice.
+ */
+function reasonQuotesReply(job, timeline = []) {
+  const newest = timeline.filter((t) => t.actor === "customer").sort(newestFirst)[0];
+  return Boolean(job.unread_inbound_at && newest?.body);
+}
+
 /** The outcome-sheet subject for this job, shaped like a Today card. */
 function subjectFrom(detail) {
   const { job, customer, timeline = [], outcomes = [] } = detail;
@@ -263,7 +272,7 @@ export function JobScreen({ id }) {
           .filter(Boolean).join(" · ")}
         ${Boolean(job.urgent) && open && html` <span class="badge badge-urgent">URGENT</span>`}
       </p>
-      ${job.on_today && job.reason && html`<p class="job-reason">${job.reason}</p>`}
+      ${job.on_today && job.reason && !reasonQuotesReply(job, timeline) && html`<p class="job-reason">${job.reason}</p>`}
       <${ReplyQuote} inbound=${inbound} />
       <${NextDateLine} job=${job} now=${now} tz=${app.tz} onChange=${() => app.openSheet(subject, { initialOutcome: "snooze" })} />
       ${open && subject.outcomes.length > 0 && html`<button type="button" class="btn btn-primary"

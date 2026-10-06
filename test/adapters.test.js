@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
 import {
   htmlToText, formExternalId, fromRawEmail, fromTwilioVoice, fromPostmark, fromMailgun, fromForm, fromGeneric,
-  verifyMailgunSignature, VOICEMAIL_PLACEHOLDER,
+  decodeFormData, verifyMailgunSignature, VOICEMAIL_PLACEHOLDER,
 } from "../server/adapters.js";
 
 // ---------------------------------------------------------------------------
@@ -27,9 +27,19 @@ test("htmlToText stays linear on hostile input: 1 MB of unclosed openers in well
     const ms = performance.now() - start;
     assert.ok(ms < 200, `${opener}: ${ms.toFixed(1)} ms`);
   }
-  // Long ordinary HTML is cut at 100 KB but keeps its beginning.
+  // Long ordinary HTML keeps its beginning; the text stops at 100 KB.
   const long = `<p>Freezer down</p>${"<p>filler text</p>".repeat(20_000)}`;
-  assert.ok(htmlToText(long).startsWith("Freezer down\nfiller text"));
+  const text = htmlToText(long);
+  assert.ok(text.startsWith("Freezer down\nfiller text") && text.length <= 100_000, String(text.length));
+});
+
+test("htmlToText reads past a long <head><style>: the form after 100 KB of CSS is still the lead (intake-N5)", () => {
+  const html = `<html><head><style>${".x{color:red}".repeat(8_000)}</style></head><body><table>`
+    + "<tr><td>Name</td><td>Rita Moreno</td></tr><tr><td>Phone</td><td>312-555-7350</td></tr>"
+    + "<tr><td>Message</td><td>Walk-in freezer is down</td></tr></table></body></html>";
+  assert.ok(html.length > 100_000);
+  const event = fromPostmark({ FromFull: { Email: "wordpress@frostline.example" }, HtmlBody: html, MessageID: "n5" });
+  assert.deepEqual([event.channel, event.body], ["form", "Name\tRita Moreno\nPhone\t312-555-7350\nMessage\tWalk-in freezer is down"]);
 });
 
 // ---------------------------------------------------------------------------
@@ -173,4 +183,67 @@ test("verifyMailgunSignature: a valid HMAC with a timestamp within 5 minutes of 
   assert.equal(verifyMailgunSignature("mg-key", signed(nowMs / 1000 - 10 * 60), nowMs), false, "10 minutes old");
   assert.equal(verifyMailgunSignature("mg-key", signed(nowMs / 1000 + 10 * 60), nowMs), false, "from the future");
   assert.equal(verifyMailgunSignature("mg-key", { ...fresh, timestamp: "soon" }, nowMs), false);
+});
+
+// ---------------------------------------------------------------------------
+// Re-verification fixes (intake-N3, N8, N9, N11)
+
+test("raw emails: RFC 2047 encoded names and subjects are decoded (intake-N9)", () => {
+  const event = fromRawEmail("From: =?UTF-8?B?Sm9zw6kgR2FyY8OtYQ==?= <jose@cafe.example>\nSubject: =?UTF-8?Q?Caf=C3=A9_reach-in?=\n"
+    + "Message-ID: <enc1@x>\n\nOur reach-in is warm, call me 312-555-7330");
+  assert.deepEqual([event.from_name, event.from_email, event.subject], ["José García", "jose@cafe.example", "Café reach-in"]);
+  // A folded header splits one name over two encoded words; the space between them is not part of it.
+  const folded = fromRawEmail("From: =?iso-8859-1?Q?Ren=E9?=\n =?UTF-8?B?IEzDqXZ5?= <rene@x.example>\nSubject: hi\n\nfreezer warm");
+  assert.equal(folded.from_name, "René Lévy");
+});
+
+test("fromForm: a composite name field reads as one name (intake-N11)", () => {
+  const event = fromForm({ name: { first: "Jo", last: "King" }, phone: "3125557360", message: "reach-in warm" });
+  assert.deepEqual([event.from_name, event.form_fields.contact_name], ["Jo King", "Jo King"]);
+});
+
+test("emails say whether the sender came from Reply-To, so a form's Reply-To can be the customer (intake-N3)", () => {
+  const body = "You have a new form submission.\n\nFull Name: Carla Diaz\nComments: Display case not cooling, please email me";
+  const replied = fromPostmark({ FromFull: { Email: "no-reply@crm.wix.com" }, ReplyTo: "Carla Diaz <carla@diaz.example>", TextBody: body, MessageID: "n3" });
+  assert.deepEqual([replied.channel, replied.from_email, replied.from_reply_to], ["form", "carla@diaz.example", true]);
+  assert.equal(fromPostmark({ FromFull: { Email: "no-reply@crm.wix.com" }, TextBody: body, MessageID: "n3b" }).from_reply_to, false);
+});
+
+/** A multipart/form-data body as a client sends it, with CRLF line ends. */
+function formDataBody(boundary, parts) {
+  const chunks = parts.flatMap(({ name, value, filename, type }) => [
+    `--${boundary}\r\nContent-Disposition: form-data; name="${name}"${filename ? `; filename="${filename}"` : ""}\r\n`
+      + `${type ? `Content-Type: ${type}\r\n` : ""}\r\n`,
+    value, "\r\n",
+  ]);
+  return Buffer.concat([...chunks, `--${boundary}--\r\n`].map((c) => (Buffer.isBuffer(c) ? c : Buffer.from(c))));
+}
+
+test("decodeFormData keeps text fields and only the name, type and size of files (intake-N8)", () => {
+  const photo = Buffer.from([0xff, 0xd8, 0xff, 0x00, 0x0d, 0x0a, 0x2d, 0x2d, 0xd9]);
+  const body = formDataBody("XyZ", [
+    { name: "sender", value: "kim@sushiyo.example" },
+    { name: "body-plain", value: "Our reach-in is at 45. José says 312-555-7340" },
+    { name: "attachment-1", value: photo, filename: "photo.jpg", type: "image/jpeg" },
+  ]);
+  const fields = decodeFormData(body, "multipart/form-data; boundary=XyZ");
+  assert.deepEqual(fields, {
+    sender: "kim@sushiyo.example", "body-plain": "Our reach-in is at 45. José says 312-555-7340",
+    "attachment-1": { filename: "photo.jpg", type: "image/jpeg", size: photo.length },
+  });
+  assert.deepEqual(decodeFormData(body, "multipart/form-data"), {}, "no boundary, nothing read");
+  const mailgun = fromMailgun(fields);
+  assert.deepEqual([mailgun.from_email, mailgun.body], ["kim@sushiyo.example", "Our reach-in is at 45. José says 312-555-7340\n[1 attachment]"]);
+  const upload = fromForm({ name: "Kim", phone: "3125557340", message: "reach-in warm", photo: fields["attachment-1"] });
+  assert.deepEqual([upload.body, upload.form_fields.message], ["reach-in warm\n[1 attachment]", "reach-in warm"]);
+});
+
+test("Postmark attachments are noted in the body and stored without their contents (intake-N8)", () => {
+  const content = Buffer.alloc(2_000_000, 7).toString("base64");
+  const event = fromPostmark({
+    FromFull: { Email: "kim@sushiyo.example" }, TextBody: "Our reach-in is at 45", MessageID: "pm-att",
+    Attachments: [{ Name: "photo.jpg", ContentType: "image/jpeg", ContentLength: 2_000_000, Content: content }],
+  });
+  assert.equal(event.body, "Our reach-in is at 45\n[1 attachment]");
+  assert.deepEqual(event.raw.Attachments, [{ Name: "photo.jpg", ContentType: "image/jpeg", ContentLength: 2_000_000 }]);
 });

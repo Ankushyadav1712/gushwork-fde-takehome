@@ -3,3 +3,5 @@ data/*.db
 data/*.db-*
 .env
 .DS_Store
+public/shared/
+.vercel

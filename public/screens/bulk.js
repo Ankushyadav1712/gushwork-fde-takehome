@@ -12,8 +12,9 @@ const PLACEHOLDER = "One job per line, like: Joe's Diner walk-in, quoted 1800 tu
 const ROW_STAGES = STAGES.filter((s) => s.id !== "lost");
 const QUOTE_SENT_HM = "12:00";
 
+/** The name to show, else the phone as she'd write it (a phone-only line is titled by its number). */
 function whoOf(fields = {}) {
-  return fields.business_name || fields.contact_name || fields.phone || "";
+  return fields.business_name || fields.contact_name || phoneDisplay(fields.phone) || "";
 }
 
 /** The phone as she typed it: shown formatted once it is a full number, saved as E.164 (or as typed until then). */

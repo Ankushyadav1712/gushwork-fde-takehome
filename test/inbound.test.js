@@ -355,10 +355,12 @@ test("C2: boot warns when signatures are on but PUBLIC_URL can't be the address 
   assert.match(webhookUrlWarning({ TWILIO_AUTH_TOKEN: "t", PUBLIC_URL: "http://127.0.0.1:4300/" }), /localhost/);
 });
 
-test("bodies over 1 MB get 413; an empty body gets 400; plain text to sms or call gets 415 (intake RT-6)", async () => {
+test("bodies over the route's limit (email 25 MB, else 1 MB) get 413; an empty body 400; plain text to sms or call 415 (intake RT-6)", async () => {
   const { db, base } = await startApp();
-  const big = await post(base, "/api/inbound/email", json({ from: "a@b.example", text: "x".repeat(1_100_000) }));
-  assert.deepEqual([big.status, big.json.error.code], [413, "validation"]);
+  const big = await post(base, "/api/inbound/form", json({ name: "Ann", message: "x".repeat(1_100_000) }));
+  assert.deepEqual([big.status, big.json.error], [413, { code: "validation", message: "Body is over 1 MB." }]);
+  const huge = await post(base, "/api/inbound/email", json({ from: "a@b.example", text: "x".repeat(27_000_000) }));
+  assert.deepEqual([huge.status, huge.json.error], [413, { code: "validation", message: "Body is over 25 MB." }]);
   const empty = await post(base, "/api/inbound/form", json({}));
   assert.equal(empty.status, 400);
   for (const path of ["/api/inbound/sms", "/api/inbound/call"]) {
@@ -532,7 +534,9 @@ test("emails Denise forwards are known by the customer in them, not by her addre
   const bob = await post(base, "/api/inbound/email", forward("f-2", "Bob Grocer <bob@grocer.example>", "Ice machine not making ice. 312-555-0182"));
   assert.deepEqual([ann.json.status, bob.json.status], ["created_job", "created_job"]);
   assert.deepEqual([customerOf(db, bob.json.job_id).contact_name, customerOf(db, bob.json.job_id).phone], ["Bob Grocer", "+13125550182"]);
-  assert.equal(get(db, "SELECT count(*) AS n FROM customers WHERE email IS NOT NULL").n, 0);
+  // The forwarded From line is the customer's address (intake-N2); hers is never stored.
+  assert.deepEqual([customerOf(db, ann.json.job_id).email, customerOf(db, bob.json.job_id).email], ["ann@bistro.example", "bob@grocer.example"]);
+  assert.equal(get(db, "SELECT count(*) AS n FROM customers WHERE email = 'denise@frostline.example'").n, 0);
 
   // Her own address is never identity, even without a forward marker.
   const note = await post(base, "/api/inbound/email", postmark({ id: "f-3", from: "denise@frostline.example", subject: "note",
@@ -607,3 +611,116 @@ test("Phase 2: a short answered call stays ignored when the parent status callba
     [{ status: "ignored", external_id: "CA_F", call_status: "answered", call_duration_s: 8 }]);
   assert.equal(count(db, "jobs"), 0);
 });
+
+// ---------------------------------------------------------------------------
+// Re-verification fixes: who an email is from (intake-N1..N4, N6) and attachments (N8)
+
+/** A Gmail-style forward of `from`'s email. */
+const forwarded = (from, text) => `See below.\n\n---------- Forwarded message ---------\nFrom: ${from}\n`
+  + `Date: Mon, Oct 5, 2026 at 6:30 AM\nSubject: walk-in\nTo: <denise@frostline.example>\n\n${text}\n`;
+
+test("Denise's forwards of a lead with no phone keep the lead's address, so the follow-up finds the job (intake-N2)", async () => {
+  for (const settings of [{}, { owner_email: "denise@frostline.example" }]) {
+    const { db, base } = await startApp({ settings });
+    const forward = (id, text) => post(base, "/api/inbound/email", postmark({ id, from: "denise@frostline.example", name: "Denise",
+      subject: "Fwd: walk-in", text: forwarded("Ann Chef <ann@bistro.example>", text) }));
+    const first = await forward("n2-1", "Hi Denise, our walk-in cooler is warm. Please email me back with a time.");
+    const second = await forward("n2-2", "Following up - any time today?");
+    assert.deepEqual([first.json.status, second.json.status, second.json.job_id], ["created_job", "attached", first.json.job_id]);
+    const ann = customerOf(db, first.json.job_id);
+    assert.deepEqual([ann.contact_name, ann.email, count(db, "customers")], ["Ann Chef", "ann@bistro.example", 1]);
+  }
+});
+
+test("a customer who forwards something to Denise is still the sender: it goes on their open job (intake-N4)", async () => {
+  for (const settings of [{}, { owner_email: "denise@frostline.example" }]) {
+    const { db, base } = await startApp({ settings });
+    const tom = (id, subject, text) => post(base, "/api/inbound/email",
+      postmark({ id, from: "tbecker@northsidecold.example", name: "Tom Becker", subject, text }));
+    const first = await tom("n4-1", "Freezer", "Our walk-in freezer is icing up.");
+    const fwd = await tom("n4-2", "Fwd: freezer", forwarded("Chef Lars <lars@northsidecold.example>", "The freezer is at 20F."));
+    assert.deepEqual([fwd.json.status, fwd.json.job_id, count(db, "customers")], ["attached", first.json.job_id, 1]);
+    assert.equal(repo.getJobRow(db, first.json.job_id).urgent, 1, "the forwarded text still raises urgency");
+  }
+});
+
+test("a known customer emailing from their own address with a new phone still reaches their open job (intake-N1)", async () => {
+  const { db, base } = await startApp({ settings: { owner_email: "denise@frostline.example" } });
+  const tom = (id, text) => post(base, "/api/inbound/email",
+    postmark({ id, from: "tbecker@northsidecold.example", name: "Tom Becker", subject: "Re: your quote", text }));
+  const first = await tom("n1-1", "Can you quote the walk-in freezer fans? 312-555-0112");
+  const yes = await tom("n1-2", "Yes go ahead. Call my cell 312-555-0999 to set it up.");
+  assert.deepEqual([yes.json.status, yes.json.job_id, count(db, "customers")], ["attached", first.json.job_id, 1]);
+  assert.equal(customerOf(db, first.json.job_id).phone, "+13125550112", "the phone on file is kept");
+  // A relay sender is never matched by email when the phone is new: each form lead stays its own.
+  const form = (id, phone) => post(base, "/api/inbound/email", postmark({ id, from: "no-reply@crm.wix.com",
+    text: `Full Name: Ann\nPhone Number: ${phone}\nEmail: tbecker@northsidecold.example\nComments: freezer warm` }));
+  assert.equal((await form("n1-3", "312-555-0998")).json.status, "created_job");
+});
+
+test("until owner_email is set, a sender's address doesn't beat a new phone: it may be Denise's own notes", async () => {
+  const { db, base } = await startApp();
+  const note = (id, text) => post(base, "/api/inbound/email",
+    postmark({ id, from: "denise@frostline.example", name: "Denise", subject: "note", text }));
+  const joes = await note("own-1", "Joe's Diner 312-555-4401 reach-in warm");
+  const lakeside = await note("own-2", "Lakeside Cafe 312-555-4402 ice machine down");
+  assert.deepEqual([lakeside.json.status, count(db, "jobs")], ["created_job", 2]);
+  assert.notEqual(lakeside.json.customer_id, joes.json.customer_id);
+});
+
+test("a form notification's Reply-To is the customer's address, so their next email finds the job (intake-N3)", async () => {
+  const { db, base } = await startApp();
+  const wix = (id, text) => post(base, "/api/inbound/email", json({ FromFull: { Email: "no-reply@crm.wix.com", Name: "Wix Forms" },
+    ReplyTo: "Carla Diaz <carla@diaz.example>", TextBody: text, MessageID: id }));
+  const lead = await wix("n3-1", "You have a new form submission.\n\nFull Name: Carla Diaz\nComments: Display case not cooling, please email me");
+  const carla = customerOf(db, lead.json.job_id);
+  assert.deepEqual([carla.contact_name, carla.email], ["Carla Diaz", "carla@diaz.example"]);
+  const reply = await post(base, "/api/inbound/email", postmark({ id: "n3-2", from: "carla@diaz.example", text: "Any time today works." }));
+  assert.deepEqual([reply.json.status, reply.json.job_id], ["attached", lead.json.job_id]);
+});
+
+test("an address with an apostrophe keeps the sender's address and name (intake-N6)", async () => {
+  const { db, base } = await startApp();
+  const r = await post(base, "/api/inbound/email", postmark({ id: "n6", from: "sean.o'brien@obriens-pub.example", name: "Sean O'Brien",
+    text: "Our keg cooler is warm, please email me back" }));
+  const sean = customerOf(db, r.json.job_id);
+  assert.deepEqual([lastMessage(db).from_email, sean.email, sean.contact_name],
+    ["sean.o'brien@obriens-pub.example", "sean.o'brien@obriens-pub.example", "Sean O'Brien"]);
+});
+
+test("attachments: Mailgun and form posts as multipart/form-data, and Postmark JSON past 1 MB, are all kept (intake-N8)", async () => {
+  const { db, base } = await startApp();
+  const photo = new Blob([Buffer.alloc(20_000, 1)], { type: "image/jpeg" });
+  const mailgun = new FormData();
+  mailgun.set("sender", "kim@sushiyo.example");
+  mailgun.set("body-plain", "Our reach-in is at 45. 312-555-7340");
+  mailgun.set("attachment-1", photo, "photo.jpg");
+  const email = await fetch(`${base}/api/inbound/email`, { method: "POST", body: mailgun }).then((res) => res.json());
+  assert.equal(email.status, "created_job");
+  const msg = repo.getMessage(db, email.message_id);
+  assert.deepEqual([msg.provider, msg.body, customerOf(db, email.job_id).phone],
+    ["mailgun", "Our reach-in is at 45. 312-555-7340\n[1 attachment]", "+13125557340"]);
+  assert.deepEqual(msg.raw["attachment-1"], { filename: "photo.jpg", type: "image/jpeg", size: 20_000 });
+
+  const webForm = new FormData();
+  webForm.set("name", "Kim");
+  webForm.set("phone", "3125557341");
+  webForm.set("message", "prep table warm");
+  const viaForm = await fetch(`${base}/api/inbound/form`, { method: "POST", body: webForm }).then((res) => res.json());
+  assert.deepEqual([viaForm.status, repo.getJobRow(db, viaForm.job_id).problem], ["created_job", "Prep table warm"]);
+
+  const content = Buffer.alloc(3_000_000, 2).toString("base64");
+  const big = await post(base, "/api/inbound/email", json({ FromFull: { Email: "lee@diner.example" }, TextBody: "Walk-in is warm, photo attached",
+    MessageID: "n8-pm", Attachments: [{ Name: "walkin.jpg", ContentType: "image/jpeg", ContentLength: 3_000_000, Content: content }] }));
+  assert.equal(big.json.status, "created_job");
+  const stored = repo.getMessage(db, big.json.message_id);
+  assert.ok(stored.raw_json.length < 10_000, "attachment contents are not stored");
+  assert.deepEqual(stored.raw.Attachments, [{ Name: "walkin.jpg", ContentType: "image/jpeg", ContentLength: 3_000_000 }]);
+});
+
+test("with INBOUND_TOKEN set, a request without it is refused before its body is read (intake-N8)", withEnv({ INBOUND_TOKEN: "s3cret" }, async () => {
+  const { db, base } = await startApp();
+  const huge = await post(base, "/api/inbound/email", json({ from: "a@b.example", text: "x".repeat(27_000_000) }));
+  assert.deepEqual([huge.status, huge.json.error.code], [401, "unauthorized"]);
+  assert.equal(count(db, "messages"), 0);
+}));
